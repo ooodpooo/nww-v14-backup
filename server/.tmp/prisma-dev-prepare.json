@@ -1,0 +1,5 @@
+{
+  "schemaMtimeMs": 1793507951000,
+  "prismaSchemaPath": "src/prisma/schema.sqlite.prisma",
+  "databaseProvider": "sqlite"
+}

@@ -1,0 +1,40 @@
+{
+  "name": "nww-v14",
+  "version": "14.0.0",
+  "private": true,
+  "description": "NWW-V14: nww-v12 内核 + AI-Novel-Writing-Assistant 前端UI 整合版",
+  "license": "AGPL-3.0-only",
+  "packageManager": "pnpm@10.6.0",
+  "engines": {
+    "node": "^20.19.0 || ^22.12.0 || >=24.0.0",
+    "pnpm": ">=10.6.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @ai-novel/shared build && concurrently -n kernel,server,client -c blue,green,yellow \"pnpm dev:kernel\" \"pnpm dev:server\" \"pnpm dev:client\"",
+    "dev:kernel": "cd nww-kernel/web/backend && PORT=8210 bash start.sh",
+    "dev:server": "pnpm --filter @ai-novel/server dev",
+    "dev:client": "pnpm --filter @ai-novel/client dev",
+    "dev:all": "pnpm run dev",
+    "restart": "bash restart.sh restart",
+    "stop": "bash restart.sh stop",
+    "status": "bash restart.sh status",
+    "install:all": "pnpm install && .venv/bin/pip install -r nww-kernel/web/backend/requirements.txt",
+    "build": "pnpm --filter @ai-novel/shared build && pnpm --filter @ai-novel/server build && pnpm --filter @ai-novel/client build",
+    "typecheck": "pnpm --filter @ai-novel/shared build && pnpm --filter @ai-novel/server typecheck && pnpm --filter @ai-novel/client typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@prisma/engines",
+      "better-sqlite3",
+      "esbuild",
+      "prisma"
+    ],
+    "overrides": {
+      "@assistant-ui/store": "0.2.9"
+    }
+  }
+}

@@ -1,0 +1,86 @@
+import type {
+  ChapterEditorAiRevisionRequest,
+  ChapterEditorAiRevisionResponse,
+  Chapter,
+  ChapterEditorDiagnosticCard,
+  ChapterEditorOperation,
+  ChapterEditorCursorContinuationRequest,
+  ChapterEditorCursorOperation,
+  ChapterEditorRevisionScope,
+  ChapterEditorWorkspaceResponse,
+} from "@ai-novel/shared/types/novel";
+
+export type ChapterEditorLayoutMode = "standard" | "wide" | "immersive";
+
+export interface ChapterEditorSelectionRange {
+  from: number;
+  to: number;
+  text: string;
+}
+
+export interface ChapterEditorSessionState extends Partial<ChapterEditorAiRevisionResponse> {
+  status: "idle" | "loading" | "ready" | "error";
+  requestLabel?: string;
+  customInstruction?: string;
+  viewMode: "inline" | "block";
+  errorMessage?: string;
+  mode: "revision" | "continuation";
+  continuationOperation?: ChapterEditorCursorOperation;
+  diagnosticCard?: ChapterEditorDiagnosticCard;
+}
+
+export interface ChapterEditorCursorRequestBuilderInput {
+  operation: ChapterEditorCursorOperation;
+  cursorOffset: number;
+  content: string;
+  context: ChapterEditorCursorContinuationRequest["context"];
+  instruction?: string;
+  provider?: import("@ai-novel/shared/types/llm").LLMProvider;
+  model?: string;
+  temperature?: number;
+}
+
+export interface ChapterEditorShellProps {
+  novelId: string;
+  chapter: Chapter | undefined;
+  /** Extra controls rendered at the left of the editor toolbar row (host-page actions). */
+  headerExtra?: import("react").ReactNode;
+  workspace: ChapterEditorWorkspaceResponse | null;
+  workspaceStatus: "loading" | "ready" | "error";
+  onBack?: () => void;
+  backLabel?: string;
+  onChapterSaved?: () => Promise<void>;
+  onEditingStateChange?: (state: { isDirty: boolean; isBusy: boolean; hasCandidate: boolean }) => void;
+  onOpenVersionHistory?: () => void;
+  onRefreshWorkspace?: () => void;
+  isRefreshingWorkspace?: boolean;
+  onRunFullAudit?: () => void;
+  onGenerateChapterPlan?: () => void;
+  onReplanChapter?: () => void;
+  isRunningFullAudit?: boolean;
+  isGeneratingChapterPlan?: boolean;
+  isReplanningChapter?: boolean;
+}
+
+export interface ChapterEditorRequestBuilderInput {
+  source: "preset" | "freeform";
+  scope: ChapterEditorRevisionScope;
+  presetOperation?: ChapterEditorOperation;
+  instruction?: string;
+  repairBrief?: ChapterEditorAiRevisionRequest["repairBrief"];
+  selection?: ChapterEditorSelectionRange | null;
+  content: string;
+  contextRange?: ChapterEditorSelectionRange | null;
+  provider?: import("@ai-novel/shared/types/llm").LLMProvider;
+  model?: string;
+  temperature?: number;
+}
+
+export interface ChapterEditorDiagnosticSelectionState {
+  card: ChapterEditorDiagnosticCard;
+  fromTask?: boolean;
+}
+
+export type BuildAiRevisionRequest = (
+  input: ChapterEditorRequestBuilderInput,
+) => ChapterEditorAiRevisionRequest;

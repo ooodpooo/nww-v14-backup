@@ -1,0 +1,2278 @@
+"""pipeline.py — 写章闭环编排器（多环节独立 agent + 确定性护栏 + fail-closed）。
+
+流程：
+  0. prealign（可选,advisory）：nww-architect 检查细纲结构层缺口
+  1. packet          ：nww_packet_builder.py（含前导零细纲兼容）
+  2. writer          ：narrative-writer agent 生成正文（本地大模型）
+  3. 落盘            ：正文/第N章.md（样式跟随书内现有命名）
+  4. delta 草稿      ：nww_delta_draft.py 确定性预填追踪/delta_第N章.json
+  5. delta 补语义    ：LLM 补齐【草稿】留白字段（result/cost/commitments/timeline/global）
+  6. post_write      ：nww_post_write.py（enforce → commit → cross_chapter）BLOCK 点
+  7. deslop 机械层   ：check-ai-patterns / check-degeneration / normalize-punctuation（advisory）
+
+每个环节独立执行、独立记录，任一步失败返回该步 detail 不掩盖。
+"""
+from __future__ import annotations
+
+import difflib
+import json
+import os
+import re
+import time
+import uuid
+from pathlib import Path
+
+from .. import books
+from ..fs import book_root, is_writable, resolve_path
+from ..nwwmvp import (
+    _find_outline_file,
+    _preceding_from_body,
+    _PRECEDING_MISSING,
+    _resolve_body_target,
+)
+from . import registry, runtime, toolbox, writer_prompt
+_OUTLINE_DIR = "大纲"
+_TRACKING_DIR = "追踪"
+_DELTA_PREFIX = "delta_第"
+_DRAFT_TAG = "【草稿】"
+# 契约来源：nww_track_commit.normalize_delta 的 clean_text(..., max_bytes=480)。
+# 这里是**字节**上限，不是字符上限——中文 1 字 = 3 字节，别按字符截。
+_RESULT_MAX_BYTES = 480
+# 契约来源：nww_track_commit.normalize_delta 的 require_known_keys(delta, {...}, "delta")。
+# ★ 这是**投影白名单**：LLM 输出的 delta 只保留这些键，其余一律丢弃。
+#   为什么是投影而不是逐个 pop：pop 只能堵已知的洞，LLM 换个自造键就再 BLOCK 一次
+#   （2026-09-14 实测：先 character_changes[0].character，再 delta.global_change）。
+#   白名单与 commit 侧同源；改 commit 必须同步改这里，由 tests/test_delta_contract.py
+#   的行为探针守住 —— commit 侧白名单是 normalize_delta 内的行内字面量（:1063-1072），
+#   无法 import 取值，故用「逐键喂给真 validator 看是否报 unsupported fields」绑定。
+_DELTA_ALLOWED = {
+    "result", "character_changes", "foreshadow_changes", "timeline_events", "constraints",
+    "next_chapter_commitments", "retired_context_items", "retired_characters", "cost_change",
+    "quality_meta", "rule_loss_event", "revived_characters", "retirement_reasons", "chapter_type",
+    # P0-2 事实契约：web 只透传、不处理（gate/merge 在 commit 侧），逐键与
+    # nww_track_commit.normalize_delta 白名单绑定（tests/test_delta_contract.py T1 探针守）。
+    "contract_state", "candidate_facts", "fact_changes",
+}
+# 契约来源：nww_track_commit.clean_string_list(..., maximum=N) —— 超限是**硬拒**，不是警告。
+_DELTA_LIST_CAPS = {"constraints": 12, "retired_context_items": 11, "next_chapter_commitments": 5}
+# character_changes[i].change 上限：commit 是 clean_text(..., max_bytes=360)，同样是字节。
+_CHANGE_MAX_BYTES = 360
+
+
+class StageResult:
+    """单环节结果。"""
+
+    def __init__(self, name: str, ok: bool, detail: str = "", **extra):
+        self.name = name
+        self.ok = ok
+        self.detail = detail
+        self.extra = extra
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "ok": self.ok, "detail": self.detail, **self.extra}
+
+
+def _session_outline_compat(book: Path, chapter_id: int) -> Path:
+    """前导零兼容：细纲以 细纲_第0NN章.md 命名时，packet builder 只认
+    细纲_第N章.md。在不改动书目录的前提下，返回实际细纲路径；若精确名缺失，
+    返回前导零文件的真实路径，由调用方按此喂给 builder。
+    （builder 按 book_root 拼名，故这里改用「临时软链」方案：在 大纲/ 下建
+    精确名软链指向真实文件，用完即删。）
+    """
+    exact = book / _OUTLINE_DIR / f"细纲_第{chapter_id}章.md"
+    real = _find_outline_file(book, chapter_id)
+    if real is None:
+        raise FileNotFoundError(f"细纲不存在：大纲/细纲_第{chapter_id}章(.json|.md)")
+    if real == exact:
+        return exact  # 无需兼容
+    # 软链精确名 → 真实文件（try/finally 由调用方删除）
+    (book / _OUTLINE_DIR).mkdir(parents=True, exist_ok=True)
+    if not exact.exists():
+        exact.symlink_to(real.name)
+    return exact
+
+
+def _cleanup_outline_compat(book: Path, chapter_id: int) -> None:
+    """删除前导零兼容临时软链（仅删软链本身，不碰真实文件）。"""
+    exact = book / _OUTLINE_DIR / f"细纲_第{chapter_id}章.md"
+    try:
+        if exact.is_symlink():
+            exact.unlink()
+    except OSError:
+        pass
+
+
+# 卷级主细纲章头样式：`## 第32章 · 周执事`（分隔符可为「· / 。」或空格+连字符）
+_VOL_HDR_RE = re.compile(r"^#+\s*第\s*(\d+)\s*章\s*[·.。,、:\s-]*(.*?)\s*$")
+
+
+def _volume_outline_section(book: Path, chapter_id: int) -> tuple[str, str | None, Path] | None:
+    """从卷级主细纲切出第 chapter_id 章段落。
+
+    返回 (段落文本, 章标题, 所在卷细纲文件)，找不到该章段落返回 None。
+    （外脑裁定：新写时独立单章细纲缺失，自动从卷级主细纲补——先规划后写，卷级细纲是唯一来源底限。）
+    """
+    o_dir = book / _OUTLINE_DIR
+    if not o_dir.is_dir():
+        return None
+    for vp in sorted(o_dir.glob("第*卷细纲_*.md")):
+        try:
+            lines = vp.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        start = None
+        title: str | None = None
+        for i, ln in enumerate(lines):
+            m = _VOL_HDR_RE.match(ln.strip())
+            if m and int(m.group(1)) == chapter_id:
+                start = i
+                raw = m.group(2).strip()
+                if raw:
+                    title = raw.split()[0] if raw else None
+                break
+        if start is None:
+            continue
+        nxt = next((i for i in range(start + 1, len(lines)) if _VOL_HDR_RE.match(lines[i].strip())), len(lines))
+        seg = "\n".join(lines[start:nxt]).strip()
+        if not seg:
+            return None
+        return seg, title, vp
+    return None
+
+
+def _ensure_outline_for_write(book: Path, chapter_id: int) -> tuple[Path | None, str | None]:
+    """新写自动补细纲（外脑裁定）：独立单章细纲缺失时，从卷级主细纲切出该章段落并落盘。
+
+    返回 (独立细纲路径, 章标题)。卷级主细纲也没有该章 → (None, 章缺失原因)。
+    - 已有独立细纲 → 原样返回（不重复生成）。
+    - 存在卷级主细纲该章 → 切分落盘 大纲/细纲_第{ch}章.md，供后续 packet/prealign/writer 消费。
+    - 卷级也无 → 返回 (None, "卷级主细纲无该章"),由调用方按 BLOCK 处理，绝不凭空造。
+    仅应在「新写」流程（run_write_pipeline）调用，重写路径不得调用。
+    """
+    existing = _find_outline_file(book, chapter_id)
+    if existing is not None:
+        return existing, None
+    # 防误伤：正文文件已存在 → 该章已写过，不是新写 → 不得自动补细纲。
+    # （重写走 run_rewrite_pipeline 不调用本函数；此处兜底防止 write 端点被误用于已写章。）
+    # 用 _is_non_prose 排除 _review_snapshots/备份等非正文文件，避免把审稿快照误当正文。
+    body_dir = book / "正文"
+    if body_dir.is_dir():
+        for p in body_dir.rglob("第*章*.md"):
+            if not books._is_non_prose(p) and re.match(rf"^第0*{chapter_id}章", p.name):
+                return None, f"第{chapter_id}章正文已存在，属于已写章节，不走新写自动补细纲（请走重写流程）"
+    hit = _volume_outline_section(book, chapter_id)
+    if hit is None:
+        return None, "卷级主细纲无该章（需先在规划层补卷纲，不能凭空生成细纲）"
+    seg, title, vp = hit
+    o_dir = book / _OUTLINE_DIR
+    o_dir.mkdir(parents=True, exist_ok=True)
+    out = o_dir / f"细纲_第{chapter_id}章.md"
+    header = f"# 细纲_第{chapter_id}章　书名：{title or '未命名'}\n"
+    # 规范化字数口径：卷级段落是 `**字数目标**：N`（粗体），wordcount 只认
+    # `字数目标：N` + `字数口径：visible_chars_v1` 标准行 → 提取值并补标准两行。
+    # 卷级无字数目标时不强行编造，由 wordcount advisory 照常报告（绝不凭空造）。
+    target_m = re.search(r"^\**\s*字数目标\**\s*[:：]\s*([1-9]\d*)\s*字?\s*\**\s*$", seg, re.MULTILINE)
+    meta = ""
+    if target_m:
+        meta = f"字数目标：{target_m.group(1)}\n字数口径：visible_chars_v1\n\n"
+        seg = seg.replace(target_m.group(0), "", 1).strip()
+    out.write_text(header + "\n" + meta + seg + "\n", encoding="utf-8")
+    return out, title
+
+
+def _last_committed_chapter(book: Path) -> int | None:
+    """读追踪权威的 last_committed_chapter；无追踪状态（新书/无追踪目录）→ None（不拦）。"""
+    state_file = book / _TRACKING_DIR / "_tracking-state.json"
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        val = data.get("last_committed_chapter")
+        return int(val) if isinstance(val, int) and val > 0 else None
+    except Exception:  # noqa: BLE001 — 无追踪状态不是 gate 该炸的事
+        return None
+
+
+def _pending_uncommitted_chapter(book: Path, chapter_id: int, last: int) -> int | None:
+    """悬空章检测（P1 外脑裁定 2026-09-16）：返回 (last, chapter_id) 区间内正文已落盘的最小章号。
+
+    悬空章 = 正文存在但章号 > last_committed（写了未 commit）。
+    - write 链：任何悬空章 → BLOCK（后续新写 delta 必被判 revision、commit 必 BLOCK，白烧整轮 LLM）。
+    - rewrite 链：目标章自身悬空 = 合法恢复路径（重写悬空章正是恢复手段），只拦更小的悬空章。
+    正文存在性复用 _resolve_existing_body（与非正文排除、多候选取最新同口径）。
+    """
+    for m in range(last + 1, chapter_id):
+        if _resolve_existing_body(book, m) is not None:
+            return m
+    return None
+
+
+def _write_pending_commit_ledger(book: Path, chapter_id: int, reason: str) -> None:
+    """P2（外脑裁定）：commit BLOCK 时落恢复台账到 追踪/pending_commits/，避免人工猜断点。fail-soft。"""
+    try:
+        d = book / _TRACKING_DIR / "pending_commits"
+        d.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "chapter": chapter_id,
+            "delta": f"delta_第{chapter_id:03d}章.json",
+            "reason": reason[:2000],
+            "recoverable": True,
+            "retry_hint": f"在 Web 端对第{chapter_id}章执行「重写」：基于当前权威重新生成并提交；提交成功后本记录自动清除。",
+            "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        (d / f"第{chapter_id:03d}章.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001 — 台账写失败不影响主链报错
+        pass
+
+
+def _clear_pending_commit_ledger(book: Path, chapter_id: int) -> None:
+    """commit 成功后清除该章恢复台账（失效即删）。fail-soft。"""
+    try:
+        p = book / _TRACKING_DIR / "pending_commits" / f"第{chapter_id:03d}章.json"
+        if p.exists():
+            p.unlink()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def step_prealign(book: Path, chapter_id: int, outline: Path) -> tuple[bool, str, dict]:
+    """0. 写前对齐（advisory）：architect 检查细纲结构层缺口，发现缺项仅报告，
+    不阻断写章（v1 范围：报告先行，不强制回补细纲）。"""
+    agent = registry.get_agent("nww-architect")
+    text = outline.read_text(encoding="utf-8")
+    prompt = (
+        f"书项目根: {book}\n目标章: 第{chapter_id}章\n\n"
+        f"以下是本章细纲全文：\n{text}\n\n"
+        "请按 90 分体系结构层做写前对齐检查，逐项 Pass/Fail：\n"
+        "1. 章尾钩子（类型+内容） 2. 收益兑现（主角拿到可感知收益） 3. 决策脊柱/选择压力\n"
+        "4. 认知落差/爽点 5. 出场角色 voice 锚点 6. 字数目标 7. 本章目标统率字段\n"
+        "输出格式：每项一行 `PASS <项名>` 或 `FAIL <项名>: <缺什么>`，最后一行总结\n"
+        "`结论: READY` 或 `结论: GAP`。不要修改任何文件，只输出检查结果。"
+    )
+    out = runtime.run_agent(agent, "写前对齐检查（advisory，不修改任何内容）", prompt, temperature=0.2, max_tokens=1200)
+    ready = "结论: READY" in out
+    gap_lines = [ln for ln in out.splitlines() if ln.startswith("FAIL")]
+    return ready, out, {"ready": ready, "gap_count": len(gap_lines)}
+
+
+def step_packet(book: Path, chapter_id: int) -> tuple[Path, dict]:
+    """1. 打包：细纲 → Writing Packet（含前导零软链兼容）。"""
+    outline = _session_outline_compat(book, chapter_id)
+    real_outline = _find_outline_file(book, chapter_id)  # 真实文件（软链用于 builder，此处防清理后丢失）
+    try:
+        res = toolbox.run_script(
+            "nww_packet_builder.py", [str(book), str(chapter_id)], book, timeout=120
+        )
+        if not res["ok"]:
+            raise RuntimeError(res["stderr"] or res["stdout"])
+        packet = json.loads(res["stdout"])
+        # 前情兼容：packet builder 只认 draft/；书架书在 正文/，缺失时从上一章正文补
+        if packet.get("preceding_context") == _PRECEDING_MISSING:
+            fallback = _preceding_from_body(book, chapter_id)
+            if fallback != _PRECEDING_MISSING:
+                packet["preceding_context"] = fallback
+        # 细纲字段兼容：builder 的提取约定是旧格式（核心事件/逻辑线/必须落地…），
+        # 对 NWW-V12 节点式细纲（情节点/voice 锚点/门禁）提取为空 → 此处自行解析补全
+        # 缺失字段（只增强，不改 builder，不覆盖已有内容）。软链在 finally 即删，
+        # 故这里用 real_outline 读内容。
+        packet = _enrich_packet(book, packet, real_outline)
+    finally:
+        _cleanup_outline_compat(book, chapter_id)
+    return outline, packet
+
+
+def _enrich_packet(book: Path, packet: dict, outline: Path) -> dict:
+    """packet 缺失字段补强（纯 pipeline 侧，零耦合 skill 脚本）。
+
+    来源字段：
+      beat           → 细纲「情节点」段落全文（节点名+过程链+功能）
+      logic_line     → 细纲「门禁·剧情循环」+「前情」
+      active_characters → 细纲「出场角色 voice 锚点」的 ### 角色名 × tracking state
+    """
+    text = outline.read_text(encoding="utf-8")
+
+    if not packet.get("beat"):
+        m = re.search(r"##\s*情节点(.*?)(?=\n## |\n##\s|\Z)", text, re.S)
+        packet["beat"] = m.group(1).strip()[:1200] if m else ""
+
+    if not packet.get("logic_line"):
+        parts: list[str] = []
+        m = re.search(r"###\s*门禁·剧情循环(.*?)(?=\n### |\Z)", text, re.S)
+        if m:
+            parts.append("剧情循环：" + m.group(1).strip()[:400])
+        m = re.search(r"##\s*前情(.*?)(?=\n## |\n##\s|\Z)", text, re.S)
+        if m:
+            parts.append("前情：" + m.group(1).strip()[:400])
+        packet["logic_line"] = "\n".join(parts)[:1000] or text[:800]
+
+    if not packet.get("active_characters"):
+        state = {}
+        state_file = book / _TRACKING_DIR / "_tracking-state.json"
+        if state_file.is_file():
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        # 仅从 voice 锚点段落提取角色名（避开情节点里的 ### 节点）：
+        # 兼容两种细纲格式——① ### 角色名（e2e 机）；② - 角色｜（五行归源等列表式）。
+        names: list[str] = []
+        m_voice = re.search(r"##\s*出场角色\s*voice\s*锚点(.*?)(?=\n## |\n##\s|\Z)", text, re.S)
+        if m_voice:
+            names = re.findall(r"^###\s+(\S[^\n]{0,19})$", m_voice.group(1), re.M)
+            if not names:
+                names = re.findall(r"^[-*]\s+([\u4e00-\u9fa5]{2,4})(?:｜|[：:])", m_voice.group(1), re.M)
+        chars_db = state.get("characters", {})
+        # 只保留 tracking state 里真实注册的角色，避免把「字数目标」等列表项误当角色
+        names = [n for n in names if n in chars_db] or names[:5]
+        active: list[dict] = []
+        for name in names[:5]:
+            info = chars_db.get(name, {})
+            active.append(
+                {
+                    "name": name,
+                    "current_state": info.get("state", info.get("current_state", "正常")),
+                    "voice_rules": (info.get("voice_anchor") or info.get("voice_rules") or [])[:3],
+                }
+            )
+        packet["active_characters"] = active
+
+    # 创作价值层（L2）透传：从细纲已有字段映射 chapter_intent，供 writer 强化记忆点/情绪/人物变化。
+    # 纯增强、一次性消费，绝不进入 tracking/consistency/canon；禁止覆盖 hard_facts/must_keep/must_avoid。
+    packet["chapter_intent"] = _chapter_intent(text)
+    return packet
+
+
+def _chapter_intent(outline_text: str) -> dict:
+    """从真实细纲提取本章创作价值意图（映射，非新增上游字段，非 LLM 总结）。
+
+    映射关系（外脑裁决 + 真实细纲格式）：
+      memory_point     ← 「## 本章收益兑现」
+      emotional_peak   ← 「## 章首钩子」 + 第一~三幕
+      character_shift  ← 收益兑现里的人物变化描述
+      scene_value      ← 第一~三幕场景名
+      reader_aftertaste← 「## 落点」（章尾类型 + 章末钩子）
+    只做段落抽取与轻整理，不解读剧情。
+    """
+    def _sec(pat: str) -> str:
+        m = re.search(rf"##\s*{pat}(.*?)(?=\n##\s*|\Z)", outline_text, re.S)
+        return m.group(1).strip()[:600] if m else ""
+
+    memory_point = _sec("本章收益兑现")
+    scenes = []
+    for i in ("一", "二", "三", "四", "五"):
+        m = re.search(rf"##\s*第{i}幕[·\s].*?\n", outline_text)
+        if m:
+            scenes.append(m.group(0)[2:].strip().rstrip("\n"))
+    aftertaste = _sec("落点")
+
+    return {
+        "memory_point": memory_point,
+        "emotional_peak": _sec("章首钩子") or "\n".join(scenes),
+        "character_shift": memory_point,
+        "scene_value": "\n".join(scenes),
+        "reader_aftertaste": aftertaste,
+    }
+
+
+def step_writer(book: Path, chapter_id: int, packet: dict, on_token=None,
+                note: str = "", original_prose: str = "") -> str:
+    """2. 主笔 agent 生成正文（本地大模型直连；on_token 可选回调做流式输出）。
+
+    2026-09 创作增强基础修复：narrative-writer.md 是"多轮+工具"agent 定义，
+    不再整份塞进 system（否则单轮无工具 LLM 倾向输出工具规划而非正文）。
+    改用 writer_prompt.build_writer_system() 得到纯净正文写作方法论，配合
+    session 直连流式生成；不改变 agent 定义/packet/tracking。
+
+    note/original_prose（2026-09-16 补，修复「扩写语义塌缩」）：重写链从入口透传
+    `note`（扩写/修订要点 ≤500 字）与目标章现有正文。二者齐全时进入「原文保持式
+    重写」——主笔在原文基础上按 note 定点扩充/修订，保留原句、不重写稳定桥段，
+    而不是按细纲整章重生成；note 为空则维持原行为（按 Writing Packet 全量生成）。
+    """
+    session = (
+        "你是主笔。基于 Writing Packet 扩写第{}章正文。\n"
+        "输出格式（必须严格遵守）：正文内容放在 <prose> 与 </prose> 标签之间。\n"
+        "标签前后不要写工具调用、读取或检查清单，直接把正文完整写出。\n"
+        "正文必须完整、独立成章（以 `# 第N章　标题` 开头），不引用外部文件、不写「好的」类寒暄。\n"
+        "【结尾硬约束】结尾必须落在本章独有的动作/细节/钩子上，禁止复用上一章结尾的句子或场景"
+        "（如吹灯/灶台/底料/香气这类上一章已写过的收尾动作），禁止跨章逐字复读。".format(chapter_id)
+    )
+    if note and original_prose:
+        session += (
+            "\n【原文保持式重写（最高优先级，仅本次执行）】本章已有正文见 <original>，你必须在其基础上操作："
+            "原句、原味、原人设口吻一律保留，不重写已有稳定桥段、不复述旧稿；按下方 note 指定的扩充点"
+            "插入新内容/拉长动作与对话，两处扩充之间用原文自然衔接。<prose> 内无需标注修改痕迹，直接给完整成稿。"
+        )
+    prompt = json.dumps(packet, ensure_ascii=False, indent=2)
+    if note:
+        prompt += f"\n\n【执行要点 note】\n{note}"
+    if original_prose:
+        prompt += f"\n\n<original>\n{original_prose[:6000]}\n</original>"
+    system = session + "\n\n" + writer_prompt.build_writer_system()
+    return _writer_stream(system, prompt, on_token=on_token)
+
+
+def _writer_stream(system: str, user_prompt: str, *, on_token=None, temperature: float = 0.9) -> str:
+    """纯净 writer 流式直连：解析端点 → chat_completion_stream。
+
+    复用 runtime 的端点解析（模型中心优先，回退本地/env 档）与流式传输，
+    但不走 run_agent_stream（避免把 agent.method 整份塞进 system）。
+    temperature：写章 0.9（发散）；润色/修订 0.3（保守改动，见 step_polish）。
+    """
+    agent = registry.get_agent("narrative-writer")
+    base_url, model, key, timeout, _ = runtime._route_endpoint(agent)
+    parts: list[str] = []
+    for chunk in runtime.chat_completion_stream(
+        system, user_prompt,
+        temperature=temperature, max_tokens=8192,
+        base_url=base_url, model=model, api_key=key, timeout=timeout,
+    ):
+        parts.append(chunk)
+        if on_token is not None:
+            try:
+                on_token(chunk)
+            except runtime.AgentCancelled:
+                raise
+            except Exception:  # noqa: BLE001 — 流式回调失败不影响主链
+                pass
+    return "".join(parts)
+
+
+# 生产质量遥测层（review_observe，2026-09 外脑裁定接入生产闭环）。
+# 在 post_write(BLOCK) + deslop 之后、return 之前，以 NWW_QUALITY_OBSERVE=1 开关
+# 灰度开启。只观察：跑 detect_internal（确定性 I-A~I-J）写"质量观察" JSON，不改正文/
+# stages/return ok/tracking/评分，不触发 revision，异常隔离不影响章节提交。
+_OBSERVE_SWITCH = "NWW_QUALITY_OBSERVE"
+
+
+def review_observe(book: Path, chapter_id: int, body_path: Path) -> dict:
+    """跑确定性质量遥测（detect_internal I-A~I-J），写 {book}/追踪/质量观察/第N章.json。
+
+    creative_value 第一阶段留 null 占位（未来接 LLM 观察），不引 LLM、不改正文。
+    任何异常只返回空 dict，绝不影响主写章链。
+    """
+    outcome: dict = {"chapter": chapter_id, "source": "post_write_quality_observe", "quality_observe": {}, "meta": {}}
+    try:
+        body_text = body_path.read_text(encoding="utf-8")
+        if not body_text.strip():
+            return outcome
+        quality_dir = book / "追踪" / "质量观察"
+        quality_dir.mkdir(parents=True, exist_ok=True)
+
+        # detect_internal 位于 {repo}/quality/；临时加入 sys.path 以 import run_all
+        repo_quality = Path(__file__).resolve().parents[4] / "quality"
+        import json as _json
+        internal = {}
+        try:
+            import sys as _sys
+            if str(repo_quality) not in _sys.path:
+                _sys.path.insert(0, str(repo_quality))
+            from detect_internal import run_all
+            from objective_scorer import clean_text
+            cleaned = clean_text(body_text)
+            if cleaned.strip():
+                raw = run_all(cleaned)
+                internal = {
+                    k: {"status": v.get("status"), "score": v.get("score"), "detail": (v.get("detail") or "")[:200]}
+                    for k, v in raw.items()
+                }
+        except Exception as _ie:  # noqa: BLE001 — detect 失败不阻断
+            internal = {"_error": str(_ie)[:200]}
+
+        out = {
+            "chapter": chapter_id,
+            "source": "post_write_quality_observe",
+            "quality_observe": {
+                "internal": internal,
+                "creative_value": {"memory_point": None, "emotion_peak": None, "character_shift": None},
+            },
+            "meta": {"blocking": False, "revision_trigger": False, "observer_version": "v1"},
+        }
+        path = quality_dir / f"第{chapter_id:03d}章.json"
+        path.write_text(_json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out
+    except Exception as _exc:  # noqa: BLE001 — 遥测失败绝不悬挂主链
+        return outcome
+
+
+# 主笔输出协议：正文必须放在 <prose> 标签内（agent 自我界定边界，标签外不落盘）
+_PROSE_RE = re.compile(r"<prose>(.*?)</prose>", re.DOTALL)
+
+
+def _extract_prose(draft: str) -> str:
+    """按 <prose> 协议提取正文：只有标签内的内容会被落盘。
+
+    有 <prose> 块 → 取块内内容（多块按序拼接）；
+    无 <prose> 块 → 整段回退（模型未遵守协议，交由 _sanitize_writer_output 兜底剥元信息）。
+    """
+    blocks = _PROSE_RE.findall(draft)
+    if blocks:
+        return "\n\n".join(b.strip() for b in blocks).strip()
+    return draft
+
+
+# ---- 自动跨章去重（流程闭环：检测到即自动修复，不再需要人工） ----
+_SENT_SPLIT_RE = re.compile(r"[^。！？；\n]+[。！？；]?")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按中英文句末标点切句。"""
+    return [s.strip() for s in _SENT_SPLIT_RE.findall(text) if s.strip()]
+
+
+def _norm_sentence(s: str) -> str:
+    return re.sub(r"\s+", "", s)
+
+
+def _read_prev_chapter_full(book: Path, chapter_id: int) -> str:
+    """读上一章正文全文（去标题行）。"""
+    if chapter_id <= 1:
+        return ""
+    body = book / "正文"
+    if not body.is_dir():
+        return ""
+    for p in sorted(body.rglob("第*章*.md")):
+        if _is_non_prose(p):
+            continue        # 快照/备份不是正文，别拿它当「上一章」做去重比对
+        m = re.match(r"^第0*(\d+)章", p.name)
+        if m and int(m.group(1)) == chapter_id - 1:
+            try:
+                lines = [ln for ln in p.read_text(encoding="utf-8", errors="replace").splitlines() if not ln.lstrip().startswith("#")]
+                return "\n".join(lines)
+            except OSError:
+                return ""
+    return ""
+
+
+def _auto_dedup_prev_chapter(book: Path, chapter_id: int, text: str) -> tuple[str, list[str]]:
+    """确定性自动去重：删除正文中与上一章逐字相同的句子（跨章复制闭环兜底）。
+
+    规则：与上一章任一句子标准化后完全相同且长度 ≥15 字的句子删除；
+    被删句所在行重组（行内其余句保留）；返回 (去重后文本, 被删句子列表)。
+    合法短句呼应（<15 字）不删，避免误伤正常钩子延续。
+    """
+    if not text or chapter_id <= 1:
+        return text, []
+    prev_full = _read_prev_chapter_full(book, chapter_id)
+    if not prev_full:
+        return text, []
+    prev_set = {_norm_sentence(s) for s in _split_sentences(prev_full)}
+    removed: list[str] = []
+    out_lines: list[str] = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            out_lines.append("")
+            continue
+        sents = _split_sentences(raw)
+        if not sents:
+            out_lines.append(raw)
+            continue
+        kept = [s for s in sents if not (_norm_sentence(s) in prev_set and len(_norm_sentence(s)) >= 15)]
+        if len(kept) == len(sents):
+            out_lines.append(raw)
+            continue
+        removed.extend(s for s in sents if s not in kept)
+        if kept:
+            out_lines.append("".join(kept))
+    # 清理连续空行
+    clean: list[str] = []
+    prev_blank = False
+    for ln in out_lines:
+        if not ln.strip():
+            if not prev_blank:
+                clean.append("")
+            prev_blank = True
+        else:
+            clean.append(ln)
+            prev_blank = False
+    return "\n".join(clean).strip(), removed
+
+
+def step_normalize(book: Path, chapter_id: int, draft: str) -> tuple[str, str]:
+    """正文归一环节（独立正规环节，writer 只生成、本环节接手处理）：
+
+    ① <prose> 协议提取（agent 自我界定正文边界）
+    ② 元信息清洗（剥离英文思考/写作指示/工具调用/中段烟火值旁注/标题前残留）
+    ③ 自动跨章去重（删除与上一章逐字相同的长句）
+    返回 (正文文本, 报告文案)。
+    """
+    clean = _sanitize_writer_output(_extract_prose(draft))
+    clean, removed = _auto_dedup_prev_chapter(book, chapter_id, clean)
+    # 2026-09-15 根治：标题必须存在且三位置一（重写时以既有文件名为权威源回填）
+    clean = _ensure_title_consistent(book, chapter_id, clean)
+    rep = "prose 提取 + 元信息清洗 + 标题一致性回填"
+    if removed:
+        rep += f"；自动去重 {len(removed)} 句（与上一章重复）"
+    return clean, rep
+
+
+# ---- D1 字数收敛（复用 nww_ctl.py chapter check 判定，不新增自定义规则） ----
+_WC_TARGET_RE = re.compile(r"字数目标[：:]\s*(\d+(?:\s*[-~]\s*\d+)?)")
+
+# 扩写 note 里的“扩到N字”目标：优先匹配 扩到/扩至/扩写至/目标字数，单值或区间
+_WC_NOTE_RANGE_RE = re.compile(r"(?:扩到|扩至|扩写至|目标字数|字数目标)\s*[:：]?\s*(\d{3,5})(?:\s*[~\-到]\s*(\d{3,5}))?\s*字?")
+
+
+def _parse_wc_note(note: str) -> tuple[int, int] | None:
+    """从扩写 note 提取目标字数区间 (lower, upper)。单值 → (n, n)；无匹配/非法 → None。"""
+    m = _WC_NOTE_RANGE_RE.search(note or "")
+    if not m:
+        return None
+    lower = int(m.group(1))
+    upper = int(m.group(2)) if m.group(2) else lower
+    if not (0 < lower <= upper <= 99999):
+        return None
+    return (lower, upper)
+
+
+def _apply_wc_note_override(wc: dict, note_range: tuple[int, int] | None) -> dict:
+    """note 显式给出扩写目标字数时，覆盖 wordcount 判定目标（细纲 target 不再权威）。
+
+    - actual 明显低于区间下界 → under（扩写不足，advisory 提示，不动作）；
+    - actual 明显高于区间上界 → over → compress-once 回收到上界；
+    - 落在区间 → ok → commit。
+    保留 override=target/status/actions 供下游 compress-once 与前端展示。
+    """
+    if note_range is None or not wc.get("actual"):
+        return wc
+    lower, upper = note_range
+    actual = int(wc["actual"])
+    wc["note_override"] = True
+    wc["target"] = f"{lower}-{upper}" if upper != lower else str(upper)
+    if actual < int(lower * 0.9):
+        wc["status"] = "under"
+        wc["actions"] = ["accept-current-length"]
+    elif actual > int(upper * 1.1):
+        wc["status"] = "over"
+        wc["actions"] = ["compress-once"]
+    else:
+        wc["status"] = "ok"
+        wc["actions"] = ["commit"]
+    wc["compression"] = None
+    return wc
+
+
+def _extract_wc_target(outline_text: str) -> str | None:
+    """从细纲提取字数目标（如 3500 或 2000-2500），供 wordcount check 回退使用。"""
+    m = _WC_TARGET_RE.search(outline_text)
+    if not m:
+        return None
+    return re.sub(r"\s+", "", m.group(1))
+
+
+def step_wordcount_check(book: Path, chapter_id: int) -> dict:
+    """字数检查：优先 nww_ctl.py chapter check；失败时回退 wordcount check（细纲提取 target）。
+
+    返回 {ok, status, actual, target, actions, compression, raw}。
+    判定逻辑完全复用 skill 侧 evaluate_wordcount，Web 不自定义阈值。
+    """
+    book = book.resolve()
+    res = toolbox.run_script(
+        "nww_ctl.py",
+        ["chapter", "check", "--project", str(book), "--chapter", str(chapter_id)],
+        book, timeout=120,
+    )
+    if res["ok"]:
+        try:
+            data = json.loads(res["stdout"])
+            length = data.get("length", {})
+            return {
+                "ok": True,
+                "status": length.get("status", "invalid"),
+                "actual": length.get("actual"),
+                "target": length.get("target"),
+                "actions": data.get("available_actions", []),
+                "compression": data.get("compression"),
+                "raw": data,
+            }
+        except json.JSONDecodeError:
+            pass  # 回退到 wordcount check
+
+    # 回退：wordcount check（需从细纲提取 target）
+    outline = _find_outline_file(book, chapter_id)
+    target = None
+    if outline:
+        try:
+            target = _extract_wc_target(outline.read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    if not target:
+        return {"ok": False, "detail": f"chapter check 失败且无法提取字数目标: {(res['stderr'] or res['stdout'])[:200]}"}
+    # 回退路径找正文文件（递归 glob 兼容分卷目录 正文/第一卷/xxx.md）
+    # 排除 _review_snapshots/：第027章_round1.md 也匹配 第027章_*.md 模式。
+    # pattern 放宽（外脑裁定 R-着陆盘）：兼容「第032章.md」无标题 与「第032章_周执事.md」带标题。
+    body_path = next((p for p in (book / "正文").rglob(f"第{chapter_id:03d}章*")
+                      if not _is_non_prose(p)), None)
+    if body_path is None:
+        return {"ok": False, "detail": f"回退模式：找不到正文文件 第{chapter_id:03d}章_*.md"}
+    res2 = toolbox.run_script(
+        "nww_ctl.py",
+        ["wordcount", "check", "--file", str(body_path), "--target", target],
+        book, timeout=60,
+    )
+    if not res2["ok"]:
+        return {"ok": False, "detail": (res2["stderr"] or res2["stdout"])[:300]}
+    try:
+        data = json.loads(res2["stdout"])
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "detail": f"wordcount check 输出非 JSON: {exc}"}
+    status = data.get("status", "invalid")
+    # 回退模式下无 available_actions/compression，按 status 推导
+    actions = ["commit"] if status in ("internal_pass", "borderline") else (
+        ["compress-once", "accept-current-length"] if status == "over" else ["accept-current-length"]
+    )
+    return {
+        "ok": True,
+        "status": status,
+        "actual": data.get("actual"),
+        "target": data.get("target"),
+        "actions": actions,
+        "compression": None,
+        "raw": data,
+    }
+
+
+def step_compress_once(book: Path, chapter_id: int, packet: dict, prose_path: Path, wc: dict) -> tuple[str, str]:
+    """compress-once：让 writer 基于现有正文压缩一次（删除冗余，保留核心情节）。
+
+    仅在 length.status == over 时调用。复用 writer 方法论 + normalize 链，
+    不新增压缩规则。压缩后正文覆盖落盘，返回 (新正文, 报告)。
+    """
+    current = prose_path.read_text(encoding="utf-8")
+    comp = wc.get("compression") or {}
+    remove_range = comp.get("remove_to_user_band") or comp.get("remove_to_internal_band") or {}
+    remove_min = remove_range.get("min", 0)
+    remove_max = remove_range.get("max", remove_min)
+    # 回退模式（compression=None）：从 actual - target_max 推算
+    if remove_min == 0 and remove_max == 0:
+        actual = wc.get("actual") or 0
+        target_max = wc.get("target")
+        if isinstance(target_max, str) and "-" in target_max:
+            target_max = int(target_max.split("-")[-1])
+        elif isinstance(target_max, (int, float)):
+            target_max = int(target_max)
+        else:
+            target_max = 0
+        if actual and target_max and actual > target_max:
+            remove_min = max(1, actual - target_max)
+            remove_max = remove_min + 200
+    agent = registry.get_agent("narrative-writer")
+    prompt = (
+        f"你是压缩编辑。请压缩以下第{chapter_id}章正文，删除冗余描写与重复信息，"
+        f"保留核心情节、对话、动作与伏笔。目标删减 {remove_min}-{remove_max} 字。\n"
+        f"约束：① 不改章节标题与核心事件 ② 保留所有对话与关键动作 ③ 只删不增 ④ 输出完整正文\n\n"
+        f"{current}"
+    )
+    out = runtime.run_agent(agent, "compress-once 正文压缩", prompt, temperature=0.3, max_tokens=8192)
+    clean, rep = step_normalize(book, chapter_id, out)
+    prose_path.write_text(clean + "\n", encoding="utf-8")
+    return clean, f"compress-once（{rep}）"
+
+
+# 主笔输出确定性清洗：剥离 LLM 元信息污染（英文思考/写作指示/工具调用/中段烟火值旁注）
+_WRITER_TOOL_BLOCK_RE = re.compile(
+    r"<(?:tool_call|function|Bash|shell|execute|read|apply|think)[^>]*>.*?</(?:tool_call|function|Bash|shell|execute|read|apply|think)>",
+    re.S,
+)
+_WRITER_SMOKE_RE = re.compile(r"【烟火值：\d+】")
+# 标题行：允许行首带 markdown 装饰符（` * _ >）——writer 偶发把标题写成
+# `` `# 第28章 x` `` 或 `**# 第28章 x**`（实测 2026-09-13 第028章）。
+# 严格 `^#` 锚定会让这类标题：① 被第 2 步当成普通行留下（ascii 占比低不剔）；
+# ② 第 4/6/7 步全部失配；③ 落盘后 nww_delta_draft._TITLE_RE 也失配 →
+# 逐章记录标题回填成「【草稿】请填写章节标题」，前端 markdown 也渲染不出 H1。
+_TITLE_DECOR_RE = re.compile(r"^[`*_>\s]+")
+_TITLE_LINE_RE = re.compile(r"^#+\s*第\s*\d+\s*章")
+
+
+def _normalize_title_line(s: str) -> str | None:
+    """若 `s` 经装饰剥离后是章节标题行 → 返回规范化的 `# 第N章 …`；否则 None。
+
+    只对**疑似标题行**生效：普通正文行里的星号/反引号原样保留，零副作用。
+    幂等：正常标题 `# 第28章　道心卡壳` 进去还是它自己。
+    """
+    stripped = _TITLE_DECOR_RE.sub("", s)
+    if not _TITLE_LINE_RE.match(stripped):
+        return None
+    return re.sub(r"[`*_\s]+$", "", stripped).rstrip()
+
+
+def _sanitize_writer_output(text: str) -> str:
+    """主笔输出确定性清洗，落盘前调用（正文以中文为主，ASCII 主导行=LLM 元信息污染）。
+
+    1. 剥离 XML 风格工具调用/思考块；
+    2. 逐行过滤：ASCII 占比 > 0.55 且非章节标题 → 剔除（英文思考/写作指示/统计说明）；
+    3. 中段【烟火值：N】旁注剔除：仅保留最后一个标记（章尾合法惯例），其余删行；
+    4. 正文必须以 `# 第N章` 标题开头：标题前的残留（writer 旁注/续写）一律丢弃；
+       标题行先经 `_normalize_title_line` 剥离 markdown 装饰（见其注释）；
+    5. 段落协议归一：一段一行 + 段间空行（`\n\n`）。
+    """
+    text = _WRITER_TOOL_BLOCK_RE.sub("", text)
+    keep: list[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            # 空行本身不携带内容，段落结构由第 5 步统一重建，这里直接跳过。
+            continue
+        title = _normalize_title_line(s)
+        if title is not None:
+            keep.append(title)
+            continue
+        if re.match(r"^第\s*\d+\s*章", s):
+            keep.append(s)
+            continue
+        ascii_ratio = sum(1 for c in s if ord(c) < 128) / max(len(s), 1)
+        if ascii_ratio > 0.55:
+            continue
+        keep.append(s)
+    # 5. 段落协议归一（V12.5，2026-09-13）
+    #    长篇正文的唯一合法格式是「一段一行、段间空行」（见 writer_prompt.py 的
+    #    正文格式要求）。主笔有时只给单换行——实测第 025-028 章整章单换行。
+    #    旧实现在这里做的是 `"\n".join(keep)`，等于把空行删光后按单换行重拼：
+    #      * 落盘文件变成「紧凑正文」→ paragraph_gate 只能靠兜底协议猜段；
+    #      * nww_enforce 结尾泄漏清理取 paras[-1] = 整章，命中即整章被删；
+    #      * 前端按空行渲染时整章挤成一坨。
+    #    改为用 `\n\n` 重拼并压缩 3 个以上连续换行：**只动空白，不增删内容**。
+    out = re.sub(r"\n{3,}", "\n\n", "\n\n".join(keep)).strip()
+    smoke_idx = [i for i, ln in enumerate(out.splitlines()) if _WRITER_SMOKE_RE.search(ln)]
+    if len(smoke_idx) > 1:
+        last = smoke_idx[-1]
+        lines = [ln for i, ln in enumerate(out.splitlines()) if i == last or not _WRITER_SMOKE_RE.search(ln)]
+        out = "\n".join(lines).strip()
+    # 6. 标题前残留丢弃：正文必须以 `# 第N章` 开头
+    #    用 _TITLE_DECOR_RE 先剥装饰再判，与第 4 步同一口径。
+    head_lines = out.lstrip("\n").splitlines()
+    for i, ln in enumerate(head_lines):
+        if _TITLE_LINE_RE.match(_TITLE_DECOR_RE.sub("", ln.strip())):
+            out = "\n".join(head_lines[i:]).strip()
+            break
+    # 7. 标题行后补空行（markdown 分块要求，保证前端标题/正文区分字号）
+    #    经第 5 步归一后，标题行后面本来就有空行 → 这里是幂等兜底，
+    #    只为兼容「标题行是唯一一行」之类的退化输入。
+    head_lines = out.splitlines()
+    for i, ln in enumerate(head_lines):
+        if _TITLE_LINE_RE.match(_TITLE_DECOR_RE.sub("", ln.strip())) and i + 1 < len(head_lines) and head_lines[i + 1].strip():
+            head_lines.insert(i + 1, "")
+            break
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(head_lines).strip())
+
+
+def _ensure_title_consistent(book: Path, chapter_id: int, clean: str) -> str:
+    """确定性标题回填（2026-09-15 根治）：正文首行标题必须存在且三位置一。
+
+    _sanitize_writer_output 只做「剥标题前残留 + 保留标题行」，**从不校验标题是否
+    存在、也从不补三位**——writer 直接输出正文时清洗后首行=正文，_chapter_title
+    便回填成【草稿】（第027章重写实测：正文首行=「清晨的坊市…」，逐章记录被记为
+    `# 第027章 · 【草稿】请填写章节标题`）。
+
+    此处以「既有正文文件名」为权威标题源（`第0XX章_标题.md`）：revision 重写时
+    旧稿仍在，_resolve_existing_body 能取到；纯新写（文件尚不存在）无权威标题，
+    保持原样、不编造。标题行存在则幂等替换为 `# 第0XX章　标题`，缺位则前插。
+    """
+    existing = _resolve_existing_body(book, chapter_id)
+    if existing is None:
+        return clean
+    m = re.match(r"^第0*(\d+)章[_-](.+?)\.md$", existing.name)
+    if not m or not m.group(2).strip():
+        return clean
+    # 仅当文件名章号与目标章一致才回填（防跨章误匹配）
+    if int(m.group(1)) != chapter_id:
+        return clean
+    target_title = f"# 第{chapter_id:03d}章　{m.group(2).strip()}"
+
+    head = clean.splitlines()
+    for i, ln in enumerate(head[:5]):
+        if _TITLE_LINE_RE.match(_TITLE_DECOR_RE.sub("", ln.strip())):
+            head[i] = target_title
+            return re.sub(r"\n{3,}", "\n\n", "\n".join(head)).strip()
+    # 无标题行 → 前插标准标题行
+    return (target_title + "\n\n" + clean).strip()
+
+
+def step_delta_draft(book: Path, chapter_id: int) -> Path:
+    """4. delta 草稿预填（确定性抽取 → 追踪/delta_第N章.json）。"""
+    tracking = book / _TRACKING_DIR
+    tracking.mkdir(parents=True, exist_ok=True)
+    # 命名对齐 nww_post_write.resolve_transaction_file：第{chapter:03d}章（3 位前导零）
+    out_path = tracking / f"{_DELTA_PREFIX}{chapter_id:03d}章.json"
+    res = toolbox.run_script(
+        "nww_delta_draft.py",
+        ["--project", str(book), "--chapter", str(chapter_id), "--out", str(out_path)],
+        book,
+        timeout=120,
+    )
+    if not res["ok"] or not out_path.is_file():
+        raise RuntimeError(res["stderr"] or res["stdout"] or "delta 草稿生成失败")
+    return out_path
+
+
+def step_delta_semantic(book: Path, chapter_id: int, draft_path: Path, prose: Path) -> None:
+    """5. delta 补语义：LLM 补齐【草稿】留白语义字段（结果/代价/承诺/时间线/全局）。"""
+    raw = json.loads(draft_path.read_text(encoding="utf-8"))
+    tx = raw.get("transaction", raw)
+    delta = tx.get("delta", {})
+    # 定位章节正文（不含标题行）
+    prose_lines = [ln for ln in prose.read_text(encoding="utf-8").splitlines() if not ln.startswith("#")]
+    prose_text = "\n".join(prose_lines)
+    outline = _find_outline_file(book, chapter_id)
+    outline_text = outline.read_text(encoding="utf-8") if outline else "（细纲缺失）"
+    # P0 fix: 提取 next_timeline_id 硬值，注入 prompt 让 LLM 不再从 E001 起编
+    _hints = tx.get("_draft_hints") if isinstance(tx.get("_draft_hints"), dict) else {}
+    _next_tl_id = str(_hints.get("next_timeline_id") or "E001")
+    try:
+        _second_num = int(_next_tl_id[1:]) + 1
+    except (ValueError, IndexError):
+        _second_num = 2
+        _next_tl_id = "E001"
+
+    agent = registry.get_agent("nww-reviewer")
+    prompt = (
+        f"书项目根: {book}\n目标章: 第{chapter_id}章\n\n"
+        f"【本章细纲】\n{outline_text}\n\n"
+        f"【本章正文】\n{prose_text[:6000]}\n\n"
+        f"【delta 草稿（含【草稿】留白标记）】\n{json.dumps(delta, ensure_ascii=False, indent=2)}\n\n"
+        "任务：补齐所有标记为【草稿】或空的语义字段，已填字段原样保留。字段契约（必须严格遵守）：\n"
+        '- "result": 字符串，一两句概述本章结果（照抄正文明确事实，禁推测），不得含【草稿】\n'
+        '- "chapter_type": 字符串（推进/铺垫/爽点/代价/转折…），不得为 null\n'
+        '- "next_chapter_commitments": **纯字符串数组**（每项一言描述下一章要兑现的承诺），\n'
+        '  绝对禁止输出对象/JSON 元素；无承诺则为空数组 []\n'
+        '- "cost_change": 对象 {"device": "...", "count": 数字} 或 null\n'
+        '- "timeline_events": 对象数组（每项含 id/story_time/objective_fact/reader_knowledge）；无则 []\n'
+        f'  【A-7 闸 · 硬约束】id 必须从 **{_next_tl_id}** 开始连续递增：第一条用 {_next_tl_id}，第二条用 E{_second_num:03d}，以此类推。\n'
+        '  绝对禁止从 E001 起编，绝对禁止复用状态层已有 id，否则 commit 会被 BLOCK。\n'
+        '  同时禁止篡改已有伏笔的 importance/planted_chapter 字段（已有 id 的伏笔保留原值，\n'
+        '  新伏笔分配新 id）。\n'
+        '- "foreshadow_changes": 对象数组，每项必须含 id/summary/status/importance/planted_chapter：\n'
+        '  status 用"已埋/已回收/已过期/放弃"，importance 用"高/中/低"，planted_chapter 为整数章号（默认本章）；\n'
+        '  已有合法字段保留原值；无伏笔变更则 []\n'
+        '- "character_changes": 对象数组，**每项只能有 name 和 change 两个键**\n'
+        '  （禁止 character / character_name / description / summary 等别名）；草稿里已列出的角色一个都不能删，\n'
+        '  本章有实质变化的角色可以补进来。\n'
+        '  change 里标记了【境界/能力变化】的角色：必须在 character_snapshots 里更新对应字段。\n'
+        '  change 里标记了【状态检查】的角色：请根据正文判断 location/state 是否有变化，\n'
+        '  如需更新则在 character_snapshots 里改对应字段（如无变化保持原值）。character_snapshots\n'
+        '  已预填了所有出场角色的当前快照副本，你在副本上改即可。\n'
+        '- 严禁输出上面没提到的任何顶层键；**全局状态变化不要写进本对象**（global_change 不属于 delta）\n'
+        '- 列表条数上限：constraints ≤12、retired_context_items ≤11、next_chapter_commitments ≤5\n'
+        '- 其余字段原样保留\n'
+        '直接输出一个 JSON 对象（就是 delta 对象本身），不要任何解释、markdown 代码块或额外文本。'
+    )
+    out = runtime.run_agent(agent, "delta 语义补全（只输出 JSON）", prompt, temperature=0.2, max_tokens=4096)
+    # 剥掉可能的 ```json 围栏
+    cleaned = out.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.S)
+    filled = json.loads(cleaned)
+    # 既埋伏笔 id 集合（state.foreshadow 键）：foreshadow id 是 state 的键，
+    # 归一非法 id 分配新号时必须避开既有编号，绝不覆盖/分裂既埋伏笔。
+    _existing_fs: set[str] = set()
+    _existing_tl: set[str] = set()
+    _append_mode = chapter_id > (_last_committed_chapter(book) or 0)
+    try:
+        _state_file = book / _TRACKING_DIR / "_tracking-state.json"
+        _state_rows = json.loads(_state_file.read_text(encoding="utf-8")) or {}
+        _fs_rows = _state_rows.get("foreshadow") or {}
+        _existing_fs = {str(k) for k in _fs_rows} if isinstance(_fs_rows, dict) else set()
+        _tl_rows = _state_rows.get("timeline") or {}
+        _existing_tl = {str(k) for k in _tl_rows} if isinstance(_tl_rows, dict) else set()
+    except Exception:  # noqa: BLE001 — 读不到 state 则按空集分配，不影响既有校验
+        _existing_fs = set()
+        _existing_tl = set()
+    filled = _repair_delta(
+        filled, delta, prose_text, chapter_id,
+        existing_foreshadow_ids=_existing_fs, existing_timeline_ids=_existing_tl,
+        append_mode=_append_mode,
+    )
+    # 更新草稿中的 delta 段落（保留机械预填 + LLM 补全）
+    tx["delta"] = filled
+    # LLM 补出的角色变化需要配套快照，否则 commit 的「核心角色必须交快照」会 BLOCK
+    _reconcile_snapshots(tx, book)
+    merged = {"chapter": chapter_id, "transaction": tx} if "transaction" in raw else tx
+    draft_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _clip_utf8(text: str, max_bytes: int) -> str:
+    """按 UTF-8 **字节**裁剪，且绝不切坏多字节字符。
+
+    为什么需要它：NWW 的追踪契约（nww_track_commit.clean_text）用的是字节上限，
+    而调用方习惯按字符截。中文 1 字 = 3 字节，`s[:240]` 得到 716 字节，
+    对 480 字节的 delta.result 而言恒定超标 → commit BLOCK。
+    2026-09-13 实测于《用泡面征服修仙界》第27章重写（enforce/paragraph_gate 全 PASS
+    却卡在 `ERROR: delta.result exceeds 480 byte`）。
+    截断落在多字节字符中间时，用 errors="ignore" 丢弃残字节（结果只会更短，不会超）。
+    """
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    return raw[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _repair_delta(
+    filled: dict,
+    draft: dict,
+    prose_text: str,
+    chapter_id: int,
+    *,
+    existing_foreshadow_ids: set[str] | None = None,
+    existing_timeline_ids: set[str] | None = None,
+    append_mode: bool = True,
+) -> dict:
+    """delta 语义补全的确定性加固层（纯本模块防御，不改任何 skill 脚本）。
+
+    契约来源：nww_track_commit.verify_delta（next_chapter_commitments 为
+    字符串数组；result 不得为【草稿】占位）。LLM 输出不可信 → 强制归一。
+    """
+    out = dict(filled)
+    # 0. 顶层投影：只保留 commit 白名单内的键。
+    #    （原实现是 `out.pop("global_change", None)` —— 只堵一个已知洞。global_change 是
+    #    transaction **根级**字段、不在 delta 白名单里，投影后自然被丢弃，语义不变。）
+    out = {key: value for key, value in filled.items() if key in _DELTA_ALLOWED}
+
+    # 0b. character_changes：元素契约 {name, change}（commit:1102）。
+    #     LLM 历史上用过 character 别名（实测报错 `delta.character_changes[0] contains
+    #     unsupported fields: character`），也会用 description/summary 顶替 change。
+    #     ★ 只做**形状归一**，不做权威收敛：草稿的 character_changes 只由 _POWER_GAIN_RE
+    #     命中填充（nww_delta_draft.py:94-98），实测第030/031章均为 []；LLM 从零补出
+    #     「非境界类」角色变化（关系/立场/认知）是本链路的正常路径，砍掉会丢真实信息。
+    _NAME_KEYS = ("name", "character", "character_name", "role")
+    _TEXT_KEYS = ("change", "description", "summary", "detail")
+    _seen: set[str] = set()
+    _changes: list[dict] = []
+    for _raw in out.get("character_changes") or []:
+        if not isinstance(_raw, dict):
+            continue
+        _name = next((str(_raw[_k]).strip() for _k in _NAME_KEYS if str(_raw.get(_k) or "").strip()), "")
+        _text = next((str(_raw[_k]).strip() for _k in _TEXT_KEYS if str(_raw.get(_k) or "").strip()), "")
+        if not _name or not _text or _name in _seen:
+            continue
+        _seen.add(_name)
+        _changes.append({"name": _name, "change": _clip_utf8(_text, _CHANGE_MAX_BYTES)})
+    # 草稿已判定的角色变化不能被 LLM 丢干净：commit 要求
+    # set(character_snapshots) ⊆ {character_changes.name}（:1136-1139），而快照由草稿按自己的
+    # character_changes 生成（nww_delta_draft.py:105-108）→ 名字丢了就必然 BLOCK。补并集。
+    for _base in draft.get("character_changes") or []:
+        if not isinstance(_base, dict):
+            continue
+        _name = str(_base.get("name") or "").strip()
+        if not _name or _name in _seen:
+            continue
+        _seen.add(_name)
+        _text = str(_base.get("change") or "").strip().replace(_DRAFT_TAG, "").strip()
+        # change 不能为空（commit: clean_text 非空断言）→ 兜底文案，同 :810-812 的既有先例
+        _changes.append({
+            "name": _name,
+            "change": _clip_utf8(_text or f"第{chapter_id}章：{_name}的状态推进（待人工补充）", _CHANGE_MAX_BYTES),
+        })
+    out["character_changes"] = _changes
+
+    # 1. next_chapter_commitments：任何非字符串元素 → 抽取/丢弃，强制纯字符串数组
+    ncc = out.get("next_chapter_commitments") or draft.get("next_chapter_commitments") or []
+    norm: list[str] = []
+    for item in ncc if isinstance(ncc, list) else [ncc]:
+        if isinstance(item, dict):
+            item = item.get("commitment") or item.get("text") or item.get("content") or ""
+        if isinstance(item, str) and item.strip():
+            norm.append(item.strip())
+    # 契约：默认放行空数组；若草稿/LLM 都没写，不伪造
+    out["next_chapter_commitments"] = norm or []
+
+    # 2. result：禁【草稿】占位——仍占位时取正文前两行作为确定性兜底
+    #    ★ 必须按「字节」裁剪：commit 契约是 nww_track_commit.clean_text(max_bytes=480)
+    #    （见该文件 "delta.result"），而中文 1 字 = 3 字节。旧实现 `[:240]` 截的是
+    #    240 个**字符** = 716 字节 → 恒定超出 480 → commit 必 BLOCK
+    #    （2026-09-13 实测：《用泡面征服修仙界》第27章重写，enforce/paragraph_gate 全 PASS，
+    #    卡在 `ERROR: delta.result exceeds 480 byte`）。
+    result = str(out.get("result") or "")
+    if _DRAFT_TAG in result or not result.strip():
+        fallback = "\n".join(
+            ln.strip() for ln in prose_text.splitlines() if ln.strip() and _DRAFT_TAG not in ln
+        )
+        out["result"] = _clip_utf8(fallback or result, _RESULT_MAX_BYTES)
+    else:
+        # LLM 自己也可能写出超长 result，同一口径裁剪，别把这个 BLOCK 留给 commit
+        out["result"] = _clip_utf8(result, _RESULT_MAX_BYTES)
+
+    # 3. foreshadow_changes / timeline_events：白名单字段过滤 + 契约缺省兜底。
+    #    契约来源：nww_track_commit.normalize_foreshadow_change / normalize_timeline_change
+    #    （require_known_keys——LLM 输出 type/content 等非法字段会直接 BLOCK commit）
+    _FORESHADOW_KEYS = {
+        "action", "id", "summary", "planted_chapter", "planned_resolution_chapter",
+        "status", "importance", "core_hook", "half_life_chapters", "depends_on", "parent_id",
+    }
+    _TIMELINE_KEYS = {
+        "action", "id", "story_time", "objective_fact", "reader_knowledge",
+        "reveal_status", "reveal_chapter", "characters",
+    }
+    # LLM 常用简化状态（planted/deepened…）映射到契约枚举；未知 → "已埋"（本章关联即视为埋设/加深）
+    _FS_STATUS_MAP = {
+        "planted": "已埋", "deepened": "已埋", "new": "已埋", "used": "已埋",
+        "resolved": "已回收", "closed": "已回收",
+        "retired": "放弃", "expired": "已过期",
+    }
+    _FS_STATUS_VALID = {"已埋", "已回收", "已过期", "放弃"}
+    _FS_IMPORTANCE_VALID = {"高", "中", "低"}
+    _TL_REVEAL_VALID = {"未揭示", "部分揭示", "已揭示"}
+    for field, allowed in (("foreshadow_changes", _FORESHADOW_KEYS), ("timeline_events", _TIMELINE_KEYS)):
+        items = out.get(field) or []
+        if not isinstance(items, list):
+            continue
+        kept: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            norm = {k: v for k, v in item.items() if k in allowed}
+            if field == "foreshadow_changes" and norm.get("action") != "delete":
+                # 契约强制字段兜底：planted_chapter(int)/status/importance/summary 缺省或非法一律归一，
+                # 杜绝 "planted_chapter must be an integer" 类 BLOCK；合法值保留原样。
+                planted = norm.get("planted_chapter")
+                norm["planted_chapter"] = planted if isinstance(planted, int) and planted >= 1 else chapter_id
+                status = norm.get("status")
+                norm["status"] = status if status in _FS_STATUS_VALID else _FS_STATUS_MAP.get(status, "已埋")
+                importance = norm.get("importance")
+                norm["importance"] = importance if importance in _FS_IMPORTANCE_VALID else "中"
+                # 2026-09-15 根治（对齐 timeline 的 E 逻辑）：foreshadow id 必须 `F\d{3,}`。
+                # LLM 自造 `F_OLD_BOX` 这类语义 id 会让 commit 的
+                # `delta.foreshadow_changes[i].id must look like F001` 硬拒（第28章实测）。
+                # 合法 id 原样保留；非法 id 分配**避开既有 id** 的新编号，绝不覆盖/分裂既埋伏笔。
+                #   - 注意与 timeline 的差异：foreshadow id 是 state.foreshadow 的**键**，
+                #     若命中既有伏笔（LLM 想更新 F005 却写错）本应归位到原 id，但此处无可靠映射
+                #     （_draft_hints.active_foreshadow_mentioned 仅含 `F\d+` 合规提及，F_OLD_BOX 不在其中），
+                #     故保守分配新号，语义由 summary 保留、id 契约自洽。
+                identifier = str(norm.get("id") or "").strip()
+                if re.fullmatch(r"^F\d{3,}$", identifier):
+                    norm["id"] = identifier
+                else:
+                    # 分配新号时**同时避开**既埋伏笔 id 与本事务已保留的合法 id，
+                    # 防止同一事务内 F_OLD_BOX 与既有 F001 同时出现时撞号成两条 F001。
+                    _taken = {str(i.get("id")) for i in kept if str(i.get("id") or "").startswith("F")} \
+                        | set(existing_foreshadow_ids or ())
+                    _n = 1
+                    while f"F{_n:03d}" in _taken:
+                        _n += 1
+                    norm["id"] = f"F{_n:03d}"
+                norm.setdefault("action", "upsert")
+                norm.setdefault("summary", f"伏笔 {norm.get('id', '')} 本章关联更新")
+                norm.setdefault("core_hook", False)
+                norm.setdefault("half_life_chapters", None)
+                norm.setdefault("depends_on", [])
+                norm.setdefault("parent_id", None)
+                norm.setdefault("planned_resolution_chapter", None)
+            if field == "timeline_events" and norm.get("action") != "delete":
+                # 契约兜底：id 必须 E\d{3,}；reveal_status 必填；
+                # 未揭示 → reveal_chapter=None；部分/已揭示 → reveal_chapter 缺省补当前章。
+                # ★ A-7 撞号防线（2026-09-16 修复：所有模式统一避让 state 既有 id）：
+                #   根因：LLM 无视 next_timeline_id 提示从 E001 起编 → ch29-32 delta 全是 E001/E002/E003。
+                #   原逻辑只在 append_mode 下重编（revision/backfill 撞号直接 upsert 覆盖历史 fact）。
+                #   新逻辑：所有模式下，id 只要撞了 state 既有 id 就重编；
+                #   本事务内部已分配 id 也避让（防 commit 重复 id 硬拒）。
+                identifier = str(norm.get("id") or "")
+
+                def _renumber_tl() -> str:
+                    # 所有模式统一：从 state 最大编号 + 1 开始分配
+                    _state_max = max(
+                        (int(i[1:]) for i in (existing_timeline_ids or [])
+                         if re.fullmatch(r"E\d{3,}", i)),
+                        default=0,
+                    )
+                    # 避让 state 既有 id ∪ 本事务已分配 id
+                    _taken = set(existing_timeline_ids or []) | {str(i.get("id")) for i in kept}
+                    _n = _state_max + 1
+                    while f"E{_n:03d}" in _taken:
+                        _n += 1
+                    return f"E{_n:03d}"
+
+                if re.fullmatch(r"E\d{3,}", identifier):
+                    _occupied = (set(existing_timeline_ids or [])
+                                 | {str(i.get("id")) for i in kept})
+                    # 统一撞号防线：只要撞了 state 既有 id 就重编（所有模式）；
+                    # 本事务内部已分配 id 也避让（防 commit 重复 id 硬拒）。
+                    norm["id"] = _renumber_tl() if identifier in _occupied else identifier
+                else:
+                    norm["id"] = _renumber_tl()
+                rv = norm.get("reveal_status")
+                norm["reveal_status"] = rv if rv in _TL_REVEAL_VALID else "未揭示"
+                if norm["reveal_status"] == "未揭示":
+                    norm["reveal_chapter"] = None
+                else:
+                    rc = norm.get("reveal_chapter")
+                    norm["reveal_chapter"] = rc if isinstance(rc, int) and rc >= 1 else chapter_id
+                norm.setdefault("action", "upsert")
+                norm.setdefault("story_time", f"第{chapter_id}章事件")
+                norm.setdefault("objective_fact", f"第{chapter_id}章情节推进（细节待人工补充）")
+                norm.setdefault("reader_knowledge", f"读者获知第{chapter_id}章发生之事")
+                norm.setdefault("characters", [])
+            kept.append(norm)
+        out[field] = kept
+
+    # 4. cost_change：契约 {device, count}（nww_track_commit.normalize_cost_change:411）。
+    #    LLM 只给 device 不给 count 会 BLOCK（`count must be an integer`）→ 形状不合法
+    #    一律退回 None（= 本章无代价变化），不替它猜数字。
+    _cost = out.get("cost_change")
+    if _cost is not None:
+        _device = str((_cost.get("device") if isinstance(_cost, dict) else "") or "").strip()
+        _count = _cost.get("count") if isinstance(_cost, dict) else None
+        out["cost_change"] = (
+            {"device": _device, "count": _count}
+            if _device and isinstance(_count, int) and not isinstance(_count, bool) and _count >= 0
+            else None
+        )
+
+    # 5. 列表条数上限：commit 是硬拒（clean_string_list maximum=），这里截断而不是让它 BLOCK
+    for _key, _cap in _DELTA_LIST_CAPS.items():
+        _value = out.get(_key)
+        if isinstance(_value, list) and len(_value) > _cap:
+            out[_key] = _value[:_cap]
+    return out
+
+
+def _reconcile_snapshots(tx: dict, book: Path) -> None:
+    """给 character_changes 里「已有快照的核心角色」补齐所缺的当前快照。
+
+    为什么必须补（2026-09-14 新增，实测可达）：commit 有两条硬约束——
+      ① nww_track_commit.normalize_delta:1107-1110 —— 核心角色（已在 state.characters 或已有
+         快照）发生变化，必须在本事务里提交当前快照，否则
+         `ERROR: core character X changed but has no current snapshot`；
+      ② 同函数 :1136-1139 —— set(character_snapshots) ⊆ {character_changes.name}。
+    而后端**从不写 character_snapshots**（web/backend 全仓 grep 0 命中），它只来自草稿，
+    且草稿按**自己的** character_changes 生成（nww_delta_draft.py:105-108）。草稿的
+    character_changes 只由 _POWER_GAIN_RE 命中填充、经常为空（实测第030/031章均为 []），
+    于是 LLM 补出的角色变化没有配套快照 → 必 BLOCK。
+
+    补的是 state 里 current snapshot 的**原样副本**：与草稿同一来源、同一形态，
+    在 merge_transaction 里是幂等写回（`next_state["characters"].update(snapshots)`），
+    不改任何语义，只让契约自洽。
+
+    ★ 临时角色（不在 state.characters）**不注入**：空快照反而触发
+      `ERROR: character_snapshots.周执事.identity must be a string`，而且它们本来就不需要
+      快照（normalize_delta 视 is_core=False，仅登记为临时角色）。
+    ★ fail-soft：读不到 state 就跳过，绝不让本环节把整轮 pipeline 打挂。
+    """
+    state_file = book / _TRACKING_DIR / "_tracking-state.json"
+    try:
+        existing = (json.loads(state_file.read_text(encoding="utf-8")) or {}).get("characters") or {}
+    except Exception:  # noqa: BLE001 — 状态缺失不是本环节该负责的事
+        return
+    if not isinstance(existing, dict):
+        return
+    snaps = tx.get("character_snapshots")
+    if not isinstance(snaps, dict):
+        snaps = {}
+        tx["character_snapshots"] = snaps
+    for item in (tx.get("delta") or {}).get("character_changes") or []:
+        name = str(item.get("name") or "").strip() if isinstance(item, dict) else ""
+        if name and name not in snaps and name in existing:
+            snaps[name] = json.loads(json.dumps(existing[name], ensure_ascii=False))
+
+
+def step_post_write(book: Path, chapter_id: int, prose: Path) -> dict:
+    """6. 追踪提交 + 机械层 + 跨章检测（BLOCK 点）。"""
+    res = toolbox.run_script(
+        "nww_post_write.py",
+        ["--project", str(book), "--chapter", str(chapter_id), "--prose", str(prose), "--json"],
+        book,
+        timeout=300,
+    )
+    return res
+
+
+def step_deslop(book: Path, chapter_id: int, prose: Path) -> list[dict]:
+    """7. 去AI味机械层（advisory 只报告）：AI 模式 / 退化 / 标点 / 跨章重复。"""
+    reports = []
+    for script in ("check-ai-patterns.js", "check-degeneration.js", "normalize-punctuation.js"):
+        res = toolbox.run_script(
+            script, ["--check", str(prose)] if script != "normalize-punctuation.js" else [str(prose)],
+            book, timeout=180,
+        )
+        entry = {"script": script, "ok": res["ok"], "stdout": res["stdout"][:1200], "stderr": res["stderr"][:300]}
+        # 比喻软gate透传（外脑决策 A，纯标记不阻断）：check-ai-patterns 命中
+        # metaphor-cluster-tic（同段相邻比喻堆叠）或 metaphor-word-repeat-tic
+        # （同一喻词单章复用过高）时，给下游 revision/前端一个"建议处理"信号。
+        if script == "check-ai-patterns.js" and res.get("stdout"):
+            if "metaphor-cluster-tic" in res["stdout"] or "metaphor-word-repeat-tic" in res["stdout"]:
+                entry["suggest_revision"] = "metaphor-density"
+        reports.append(entry)
+    # 跨章重复检测（advisory）：与近 N 章逐字/短语雷同会在此报告，提示人工处理
+    try:
+        cc = toolbox.run_script(
+            "nww_cross_chapter_check.py",
+            ["--book", str(book), "--chapter", str(chapter_id), "--window", "5", "--json"],
+            book, timeout=120,
+        )
+        if cc["ok"] and cc["stdout"].strip():
+            reports.append({"script": "nww_cross_chapter_check.py", "ok": True, "stdout": cc["stdout"][:1200], "stderr": ""})
+    except Exception:  # noqa: BLE001 — advisory 失败不阻断
+        pass
+    return reports
+
+
+# ---- D2 一致性审查（consistency-checker agent 检测 + 写 追踪/一致性审查/第N章.json） ----
+# 关键区分：detection ≠ closure
+#   本函数只做 detection：调用 consistency-checker 产出 S1-S4 冲突事实，写审查记录
+#   closure（closed=true）由既有闭环流程完成，A-3 闸（追踪/一致性核验/第N章.json）不受影响
+#   审查记录格式 {"chapter": N, "open_s1_s2": [...], "s3_s4": [...], "updated_at": ts}
+#   closed 字段绝不在此写入——closure 是人工裁决或后续修复后的独立动作
+_A3_CONFLICT_RE = re.compile(r"^-\s*\[S([1-4])\]\s*(.+)$")
+
+
+def step_consistency_check(book: Path, chapter_id: int, prose_path: Path) -> dict:
+    book = book.resolve()
+    """一致性审查（detection only）：调用 consistency-checker agent，写审查记录。
+
+    只做检测 + 记录，不裁决（closed 绝不由此写入）。审查记录路径：
+    {book}/追踪/一致性审查/第{N}章.json。closure 目录（追踪/一致性核验/）由既有流程负责。
+    """
+    prose_text = prose_path.read_text(encoding="utf-8")
+    agent = registry.get_agent("consistency-checker")
+    prompt = (
+        f"书项目根: {book}\n目标章: 第{chapter_id}章\n\n"
+        f"以下是本章正文全文，请按你的方法论做事实一致性检查（S1-S4 分级）。\n"
+        f"只输出检查报告，不修改任何文件。\n\n"
+        f"{prose_text[:12000]}"
+    )
+    try:
+        out = runtime.run_agent(agent, "一致性检查（只读）", prompt, temperature=0.2, max_tokens=4096)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "detail": f"consistency-checker 调用失败: {exc}"}
+
+    # 解析 S1/S2/S3/S4（全部进入审查记录，不区分阻断）
+    open_s1_s2: list[dict] = []
+    s3_s4: list[dict] = []
+    for line in out.splitlines():
+        m = _A3_CONFLICT_RE.match(line.strip())
+        if not m:
+            continue
+        level = f"S{m.group(1)}"
+        item = {"level": level, "content": m.group(2).strip()[:300]}
+        if level in ("S1", "S2"):
+            open_s1_s2.append(item)
+        else:
+            s3_s4.append(item)
+
+    record = {
+        "chapter": chapter_id,
+        "open_s1_s2": open_s1_s2,
+        "s3_s4": s3_s4,
+        "updated_at": int(time.time()),
+    }
+    review_dir = book / "追踪" / "一致性审查"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    rec_path = review_dir / f"第{chapter_id}章.json"
+    rec_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "ok": True,
+        "has_s1_s2": len(open_s1_s2) > 0,
+        "open_s1_s2_count": len(open_s1_s2),
+        "s3_s4_count": len(s3_s4),
+        "record_path": str(rec_path.relative_to(book)),
+        "raw_report": out[:2000],
+    }
+
+
+# ---- D3 审稿闭环（score → 宿主 LLM 打分 → after-score → [revise] 循环终态 + quality_meta.reviewed 条件写入） ----
+_REVIEW_PASS_SCORE = 85  # 与 nww_review_cycle.PASS_SCORE 对齐（脚本内硬编码，此处仅用于 Web 侧判定）
+_REVIEW_MAX_ROUNDS = 2
+
+
+def _write_quality_meta(draft_path: Path, **fields) -> None:
+    """写入 delta.quality_meta 字段（参照 nww_post_write.write_meta_enforced 的事务定位逻辑）。"""
+    data = json.loads(draft_path.read_text(encoding="utf-8"))
+    tx = data.get("transaction", data) if isinstance(data, dict) else data
+    delta = tx.setdefault("delta", {})
+    if not isinstance(delta, dict):
+        delta = {}
+        tx["delta"] = delta
+    qm = delta.setdefault("quality_meta", {})
+    if not isinstance(qm, dict):
+        qm = {}
+        delta["quality_meta"] = qm
+    qm.update(fields)
+    draft_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _review_score_once(book: Path, chapter_id: int, prose_path: Path, score_prompt: str, round_num: int) -> float:
+    """让 LLM 按 score_prompt 打分，返回综合分 total。"""
+    prose_text = prose_path.read_text(encoding="utf-8")
+    agent = registry.get_agent("nww-reviewer")
+    prompt = (
+        f"{score_prompt}\n\n"
+        f"【本章正文】\n{prose_text[:10000]}\n\n"
+        f"请按上述维度打分，只输出一个 JSON 对象（含 total 字段，0-100）。"
+    )
+    out = runtime.run_agent(agent, f"审稿打分 第{round_num}轮", prompt, temperature=0.2, max_tokens=2048)
+    cleaned = out.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.S)
+    try:
+        data = json.loads(cleaned)
+        total = float(data.get("total", 0))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        # 兜底：从文本中提取数字
+        m = re.search(r'"total"\s*:\s*(\d+(?:\.\d+)?)', cleaned)
+        total = float(m.group(1)) if m else 0.0
+    return max(0.0, min(100.0, total))
+
+
+def _review_revise_once(book: Path, chapter_id: int, prose_path: Path, revise_prompt: str, round_num: int) -> None:
+    """让 LLM 按 revise_prompt 修订正文，覆盖落盘。"""
+    current = prose_path.read_text(encoding="utf-8")
+    agent = registry.get_agent("nww-reviewer")
+    prompt = (
+        f"{revise_prompt}\n\n"
+        f"【当前正文】\n{current[:10000]}\n\n"
+        f"请按上述修订指令修订正文，输出完整修订后正文（以 # 第{chapter_id}章 开头）。"
+    )
+    out = runtime.run_agent(agent, f"审稿修订 第{round_num}轮", prompt, temperature=0.6, max_tokens=8192)
+    clean, _ = step_normalize(book, chapter_id, out)
+    prose_path.write_text(clean + "\n", encoding="utf-8")
+
+
+def step_review_cycle(book: Path, chapter_id: int, prose_path: Path, draft_path: Path,
+                      review_id: str | None = None) -> dict:
+    book = book.resolve()
+    """审稿闭环：score → 宿主 LLM 打分 → after-score → 需要修订则 revise，循环直至终态。
+
+    流程控制（轮次上限/停手阈值/通过线）完全由 nww_review_cycle.py 判定，
+    Web 不复制脚本阈值逻辑，只消费脚本输出。after-score 终态分支内部
+    自动 print_finalize（打印结论）。
+    P0-1：best→final 物理落盘唯一收口点在 phase_finalize；本函数只负责
+    「判定应进入 finalize 时」触发它一次，并全程透传同一个 review_id，不自行 copy。
+    """
+    rounds_scores: list[float] = []
+    passed = False
+
+    for round_num in range(1, _REVIEW_MAX_ROUNDS + 1):
+        # 1. score phase：获取打分 prompt
+        r_score = toolbox.run_script(
+            "nww_review_cycle.py",
+            ["--project", str(book), "--chapter", str(chapter_id), "--phase", "score",
+             "--round", str(round_num)]
+            + ([f"--review-id", review_id] if review_id else []),
+            book, timeout=60,
+        )
+        if not r_score["ok"]:
+            return {"ok": False, "detail": f"score phase 失败: {r_score['stderr'][:200]}"}
+        score_prompt = r_score["stdout"]
+
+        # 2. LLM 打分
+        total = _review_score_once(book, chapter_id, prose_path, score_prompt, round_num)
+        rounds_scores.append(total)
+
+        # 3. after-score phase：脚本自动记录分数 + 判定终态/继续修订
+        r_after = toolbox.run_script(
+            "nww_review_cycle.py",
+            ["--project", str(book), "--chapter", str(chapter_id), "--phase", "after-score",
+             "--score", str(total), "--round", str(round_num)]
+            + ([f"--review-id", review_id] if review_id else []),
+            book, timeout=60,
+        )
+        after_out = r_after.get("stdout", "")
+
+        # 终态判定：after-score 内部在 pass/max_rounds/stop 三种分支里都调了 print_finalize
+        if "是否通过: 是" in after_out:
+            passed = True
+            # P0-1：唯一 best→final 物理落盘收口点在 phase_finalize。
+            # 本函数只负责触发 finalize 一次（带同一 review_id），不做任何 copy。
+            r_fin = toolbox.run_script(
+                "nww_review_cycle.py",
+                ["--project", str(book), "--chapter", str(chapter_id), "--phase", "finalize"]
+                + ([f"--review-id", review_id] if review_id else []),
+                book, timeout=60,
+            )
+            if not r_fin["ok"]:
+                return {"ok": False, "passed": True, "best_score": max(rounds_scores, default=0),
+                        "rounds": len(rounds_scores),
+                        "detail": f"finalize（best→final 落盘）失败: {r_fin['stderr'][:200]}"}
+            break
+        if "是否通过: 否" in after_out:
+            break  # 脚本已判定未通过（终态：最大轮次或净提升不足），停止
+
+        # 4. 需要修订（脚本输出修订指令）：revise phase → LLM 修订正文 → 下一轮 score
+        r_revise = toolbox.run_script(
+            "nww_review_cycle.py",
+            ["--project", str(book), "--chapter", str(chapter_id), "--phase", "revise", "--round", str(round_num)],
+            book, timeout=60,
+        )
+        if r_revise["ok"]:
+            _review_revise_once(book, chapter_id, prose_path, r_revise["stdout"], round_num)
+
+    # 5. 只有 passed=true 才写 quality_meta.reviewed=true（A-5 闸语义：通过审稿才算流程完整）
+    # 白名单字段（必须与 nww_track_commit.normalize_quality_meta 的 require_known_keys 同步，
+    # 否则 commit 会以「unsupported fields」BLOCK）：
+    #   declared/observed/enforced/enforced_at/reviewed/reviewed_at/review_score/review_rounds
+    #   + finalized/finalized_at/review_id（后者由 nww_review_cycle._write_review_meta 在 finalize 写）
+    best = max(rounds_scores) if rounds_scores else 0.0
+    # R-QC1（P1 语义解耦，2026-09-15 外脑批准）：reviewed 语义 = 审稿循环已执行并产生合法结果，
+    # 不再绑定 passed。是否通过由 review_score 对照 _REVIEW_PASS_SCORE=85 表达。
+    #   审稿循环真实打过分（一轮及以上）→ 确已执行并产出结果 → reviewed=true + score；
+    #   若连一轮 score 都没跑（rounds_scores 为空），说明循环未完成、无合法结果可登记 → 不写 reviewed。
+    #   （正常代码路径在 score/finalize 失败时会提前 return，到此处 rounds_scores 均为非空。）
+    if passed or (rounds_scores and not passed):
+        try:
+            _write_quality_meta(
+                draft_path,
+                reviewed=True,
+                review_score=int(best),
+                review_rounds=len(rounds_scores),
+                reviewed_at=int(time.time()),
+            )
+        except Exception as exc:  # noqa: BLE001 — meta 写入失败不阻断，但标记失败
+            return {
+                "ok": False,
+                "passed": passed,
+                "best_score": int(best),
+                "rounds": len(rounds_scores),
+                "detail": f"quality_meta 写入失败: {exc}",
+            }
+
+    return {
+        "ok": True,
+        "passed": passed,
+        "best_score": best,
+        "rounds": len(rounds_scores),
+        "scores": rounds_scores,
+    }
+
+
+def run_write_pipeline(book: Path, chapter_id: int, *, prealign: bool = False, progress=None, on_writer_token=None,
+                       review_id: str | None = None) -> dict:
+    """执行写章全流程闭环，返回环节报告。任何一步抛异常 → 环节 FAIL 且不再继续。
+
+    progress: 可选回调 (name, ok, detail) —— 每环节推进时调用（异步任务进度上报用）。
+    on_writer_token: 可选回调 (chunk) —— 主笔流式输出逐 token 回调（异步任务实时预览用）。
+    review_id: 一次 review run 的身份（异步=task_id；同步缺省由入口生成一次）。此后各 phase 透传，不重新生成。
+    """
+    book = book.resolve()
+    review_id = review_id or f"sync_{uuid.uuid4().hex[:12]}"
+    stages: list[StageResult] = []
+
+    def _finish(name: str, ok: bool, detail: str, **extra) -> None:
+        stages.append(StageResult(name, ok, detail, **extra))
+        if progress:
+            try:
+                progress(name, ok, detail)
+            except runtime.AgentCancelled:
+                raise
+            except Exception:  # noqa: BLE001 — 进度上报失败不影响主链
+                pass
+
+    try:
+        # 0pre. 写前连续性闸（P1 外脑裁定 2026-09-16）：存在悬空章（正文已落盘但未 commit）时，
+        #      后续新写的 delta 必被判 revision、commit 必 BLOCK（2026-09-16 第33/34章事故根因），
+        #      白烧整轮 LLM 调用。入口即拦 + 中文恢复指引。stage 复用 "packet"（与 0a 同约定，
+        #      不新增前端进度契约）。
+        _last = _last_committed_chapter(book)
+        if _last is not None:
+            _pending = _pending_uncommitted_chapter(book, chapter_id, _last)
+            if _pending is not None:
+                _finish("packet", False,
+                        f"存在未提交章节：第{_pending}章已写正文但尚未提交（当前已提交到第{_last}章）。"
+                        f"请先对第{_pending}章执行「重写」完成提交（基于当前权威重新生成并提交），再写后续章节。")
+                return {"ok": False, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+
+        # 0a. 新写自动补细纲（外脑裁定）：独立单章细纲缺失时，从卷级主细纲切出该章并落盘。
+        #     不新增 stage（避免破坏既有进度契约）；补细纲结果由后续 packet 的 detail 呈现。
+        #     重写路径 run_rewrite_pipeline 不调用本函数（已有正文/细纲），此处天然只影响新写。
+        _outline, _outline_err = _ensure_outline_for_write(book, chapter_id)
+        if _outline is None:
+            _finish("packet", False, f"打包失败: {_outline_err}")
+            return {"ok": False, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+
+        # 0. prealign（可选）
+        if prealign:
+            try:
+                outline0 = _find_outline_file(book, chapter_id)
+                if outline0:
+                    ready, out, meta = step_prealign(book, chapter_id, outline0)
+                    _finish("prealign", True, out, **{"ready": ready, "gap_count": meta["gap_count"]})
+                else:
+                    _finish("prealign", False, "细纲不存在，跳过")
+            except Exception as exc:  # noqa: BLE001 — advisory 不阻断主链
+                _finish("prealign", False, f"prealign 失败（advisory，继续）: {exc}")
+
+        # 1. 打包
+        try:
+            outline, packet = step_packet(book, chapter_id)
+            _finish("packet", True, f"细纲: {outline.relative_to(book).as_posix()}", packet=packet)
+        except runtime.AgentCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _finish("packet", False, f"打包失败: {exc}")
+            return {"ok": False, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+
+        # 2. 主笔生成（只生成正文，提交原始输出给下一环节）
+        try:
+            draft = step_writer(book, chapter_id, packet, on_token=on_writer_token)
+            _finish("writer", True, f"生成 {len(draft)} 字")
+        except runtime.AgentCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _finish("writer", False, f"主笔生成失败: {exc}")
+            return {"ok": False, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+
+        # 3. 正文归一环节（独立正规环节：prose 提取 + 元信息清洗 + 自动跨章去重）→ 落盘
+        try:
+            target, rel = _resolve_body_target(book, chapter_id)
+            clean_draft, norm_report = step_normalize(book, chapter_id, draft)
+            target.write_text(clean_draft + "\n", encoding="utf-8")
+            _finish("normalize", True, f"落盘: {rel}（{len(clean_draft)} 字；{norm_report}）", path=rel, chars=len(clean_draft))
+        except runtime.AgentCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _finish("normalize", False, f"正文归一/落盘失败: {exc}")
+            return {"ok": False, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+
+        # 3.5 字数收敛（D1）：消费 chapter check 返回的 available_actions，按脚本契约驱动一次收敛回写
+        try:
+            wc = step_wordcount_check(book, chapter_id)
+            if not wc["ok"]:
+                _finish("wordcount", False, f"字数检查失败（advisory，继续）: {wc.get('detail', '')}")
+            else:
+                actions = wc.get("actions") or []
+                actual = wc["actual"]
+                if "commit" in actions:
+                    # 脚本判定可直接 commit（internal_pass/borderline）
+                    _finish("wordcount", True, f"字数 {actual}（{wc['status']}），无需处理", wordcount=wc)
+                elif "compress-once" in actions:
+                    # 脚本判定可压缩一次
+                    try:
+                        step_compress_once(book, chapter_id, packet, target, wc)
+                        wc2 = step_wordcount_check(book, chapter_id)
+                        _finish("wordcount", True, f"compress-once 后 {wc2.get('actual')} 字（{wc2.get('status', '?')}），按脚本 action 继续", wordcount=wc2)
+                    except Exception as cexc:  # noqa: BLE001
+                        _finish("wordcount", True, f"compress-once 失败，按脚本 action 继续: {cexc}", wordcount=wc)
+                else:
+                    # 脚本给出的 action 仅 accept-current-length / revise-outline-or-target / discard，
+                    # Web 不自动裁决 revise/discard，仅报告当前状态让用户介入
+                    _finish("wordcount", True, f"字数 {actual}（{wc['status']}），available_actions={actions}", wordcount=wc)
+        except runtime.AgentCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 字数收敛失败不阻断主链
+            _finish("wordcount", False, f"字数收敛异常（继续）: {exc}")
+
+        # 4-5. delta 草稿 + 补语义
+        try:
+            draft_path = step_delta_draft(book, chapter_id)
+            _finish("delta_draft", True, f"草稿: {draft_path.relative_to(book).as_posix()}")
+        except runtime.AgentCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _finish("delta_draft", False, f"delta 草稿生成失败: {exc}")
+            return {"ok": False, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+        try:
+            step_delta_semantic(book, chapter_id, draft_path, target)
+            _finish("delta_semantic", True, "语义字段已补全")
+        except runtime.AgentCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _finish("delta_semantic", False, f"delta 补语义失败: {exc}")
+            return {"ok": False, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+
+        # 5.5 一致性审查（D2 detection）：commit 前产出审查记录；closure 由既有流程负责
+        try:
+            cons = step_consistency_check(book, chapter_id, target)
+            if cons["ok"]:
+                _finish(
+                    "consistency", True,
+                    f"审查记录: {cons['record_path']}（S1/S2={cons['open_s1_s2_count']}，S3/S4={cons['s3_s4_count']}）",
+                    consistency=cons,
+                )
+            else:
+                _finish("consistency", False, f"一致性检查失败（advisory，继续）: {cons.get('detail', '')}")
+        except runtime.AgentCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 审查失败不阻断（兼容模式 WARNING）
+            _finish("consistency", False, f"一致性审查异常（继续）: {exc}")
+
+        # 5.6 deslop 机械层（advisory）—— R-WP1 前移（2026-09-15 外脑裁定选甲）：
+        #    deslop 会改写正文（normalize-punctuation.js 以不带 --check 形态写回），须在
+        #    review_cycle 与 commit 之前，确保审稿与 commit 消费的都是 normalize 后的同一版本。
+        #    顺序：consistency → deslop → review_cycle → post_write(commit)。
+        reports = step_deslop(book, chapter_id, target)
+        _finish("deslop", True, f"脚本数: {len(reports)}", reports=reports)
+
+        # 5.7 审稿闭环（D3，时序关键：commit 前把 reviewed 准备好供 A-5 闸消费）
+        try:
+            rv = step_review_cycle(book, chapter_id, target, draft_path, review_id)
+            if rv["ok"]:
+                _finish(
+                    "review_cycle", True,
+                    f"{'通过' if rv['passed'] else '未通过'}（最高分 {rv['best_score']}，{rv['rounds']} 轮）",
+                    review=rv,
+                )
+            else:
+                _finish("review_cycle", False, f"审稿闭环失败（advisory，继续）: {rv.get('detail', '')}")
+        except runtime.AgentCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 审稿失败不阻断提交
+            _finish("review_cycle", False, f"审稿闭环异常（继续）: {exc}")
+
+        # 7.5 生产质量遥测（仅观察，advisory；NWW_QUALITY_OBSERVE=1 开启，灰度；reading target 无需阻塞）
+        if os.environ.get(_OBSERVE_SWITCH, "0") == "1":
+            try:
+                observe = review_observe(book, chapter_id, target)
+                _finish("quality_observe", True, "已写质量观察", observe=observe)
+            except Exception as _oe:  # noqa: BLE001 — 遥测失败不阻断提交
+                _finish("quality_observe", False, f"质量观察失败（advisory，继续）: {_oe}")
+
+        # 6. post_write（BLOCK 点，commit 消费 delta 里已就绪的 reviewed/enforced）
+        post = step_post_write(book, chapter_id, target)
+        # 同时消费 stdout + stderr：paragraph_gate BLOCK 详情走 stdout，commit/enforce 走 stderr
+        _finish("post_write", post["ok"],
+                (post["stdout"] + ("\n" + post["stderr"] if post["stderr"] else ""))[:2400],
+                returncode=post["returncode"])
+        if not post["ok"]:
+            # P2（外脑裁定）：commit BLOCK → 落恢复台账，让"断在第几章、为什么断"可查，
+            # 不再人工猜（2026-09-16 第32章悬空事故的直接教训）。
+            _write_pending_commit_ledger(
+                book, chapter_id,
+                f"post_write BLOCK:\n{post['stdout']}\n{post['stderr']}")
+            return {"ok": False, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+
+        # P2：commit 成功 → 该章恢复台账失效即删
+        _clear_pending_commit_ledger(book, chapter_id)
+        return {"ok": True, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001 — 编排器兜底，绝不悬挂
+        _finish("pipeline", False, f"未预期错误: {exc}")
+        return {"ok": False, "chapter_id": chapter_id, "stages": [s.to_dict() for s in stages]}
+
+
+# ---------------------------------------------------------------------------
+# 重写已有章节（revision 模式）：备份旧稿 → packet → writer → 覆盖落盘
+# → delta 草稿（对已提交章自动 mode=revision，见 nww_delta_draft.py）→ 补语义
+# → post_write（revision 无「内容必须一致」闸，A-1 计量对 revision 跳过）
+# 与 run_write_pipeline 的唯一差异：目标章必须已提交（有正文），不走 409 防覆盖。
+# ---------------------------------------------------------------------------
+_NON_PROSE_KW = ("_设定", "_笔记", "_大纲", "_细纲", "_草稿", "_废弃", "_储备")
+# 辅助目录不是正文：_review_snapshots/ 存 review round 快照。快照文件名
+# （第027章_round1.md）不含 _NON_PROSE_KW 里任何关键词，只能按**路径部件**排除。
+# 不排除的后果：多候选按 mtime 取最新 → 快照比正文新时被当成本章正文
+# （2026-09-13 实测于《用泡面征服修仙界》）。与 nww_track_commit._is_non_prose 同口径。
+_NON_PROSE_DIRS = ("_review_snapshots", "_archive")
+
+
+def _is_non_prose(p: Path) -> bool:
+    """路径是否属于「非正文」：命中辅助目录，或文件名带备份/草稿关键词。"""
+    return (
+        any(d in p.parts for d in _NON_PROSE_DIRS)
+        or "_原稿_" in p.name
+        or any(kw in p.name for kw in _NON_PROSE_KW)
+    )
+
+
+def _resolve_existing_body(book: Path, chapter_id: int) -> Path | None:
+    """定位已存在的本章正文文件（排除 _原稿_ 备份与非正文件；多候选按 mtime 取最新）。
+
+    语义对齐 nww_track_commit.resolve_chapter_file（正文目标解析的唯一权威口径）。
+    """
+    body = book / "正文"
+    if not body.is_dir():
+        return None
+    cands: list[Path] = []
+    for p in body.rglob("第*章*.md"):
+        if _is_non_prose(p):
+            continue
+        m = re.match(r"^第0*(\d+)章", p.name)
+        if m and int(m.group(1)) == chapter_id:
+            cands.append(p)
+    if not cands:
+        return None
+    cands.sort(key=lambda p: p.stat().st_mtime_ns)
+    return cands[-1]
+
+
+def run_rewrite_pipeline(book: Path, chapter_id: int, progress=None, on_writer_token=None,
+                         review_id: str | None = None, note: str = "") -> dict:
+    """重写已提交章节（revision 闭环）：旧稿备份 → 全流程重写 → revision 提交。
+
+    约定：只作用于「已有正文的已提交章」；正文不存在 → FAIL（新写走 agents/write）。
+    progress: 可选回调 (name, ok, detail) —— 每环节推进时调用（异步任务进度上报用）。
+    on_writer_token: 可选回调 (chunk) —— 主笔流式输出逐 token 回调（异步任务实时预览用）。
+    review_id: 一次 review run 身份（异步=task_id；同步缺省由入口生成一次）。
+    note（2026-09-16 补）：执行要点 ≤500 字（扩写目标字/衔接/保持原文/重点扩充段）。
+        非空时主笔进入「原文保持式重写」（读本章正文注入提示词，见 step_writer），
+        修复此前 note 被丢弃、扩写退化为整章重生成的语义塌缩。
+    """
+    book = book.resolve()
+    review_id = review_id or f"sync_{uuid.uuid4().hex[:12]}"
+    stages: list[StageResult] = []
+
+    def _finish(name: str, ok: bool, detail: str, **extra) -> None:
+        stages.append(StageResult(name, ok, detail, **extra))
+        if progress:
+            try:
+                progress(name, ok, detail)
+            except runtime.AgentCancelled:
+                raise
+            except Exception:  # noqa: BLE001 — 进度上报失败不影响主链
+                pass
+
+    def _fail() -> dict:
+        return {"ok": False, "chapter_id": chapter_id, "mode": "revision", "stages": [s.to_dict() for s in stages]}
+
+    try:
+        # 0pre. 写前连续性闸（P1 外脑裁定 2026-09-16）：重写目标章之前若存在更小的悬空章
+        #      （正文已落盘但未 commit），本链 delta 仍会错判 revision → commit BLOCK。
+        #      目标章自身悬空 = 合法恢复路径（重写悬空章正是恢复手段），不拦。
+        _last = _last_committed_chapter(book)
+        if _last is not None:
+            _pending = _pending_uncommitted_chapter(book, chapter_id, _last)
+            if _pending is not None:
+                _finish("packet", False,
+                        f"存在未提交章节：第{_pending}章已写正文但尚未提交（当前已提交到第{_last}章）。"
+                        f"请先对第{_pending}章执行「重写」完成提交，再重写后续章节。")
+                return _fail()
+
+        target = _resolve_existing_body(book, chapter_id)
+        if target is None:
+            _finish("backup", False, f"第{chapter_id}章无已提交正文（或正文已被备份改名）。新写请走 agents/write；无法重写不存在的章节。")
+            return _fail()
+
+        # 1. 写前备份（幂等：.backup/{章名}.orig.md 首份优先，已有不覆盖）
+        bk = toolbox.run_script("nww_backup.py", ["--book", str(book), "--file", str(target)], book, timeout=60)
+        if not bk["ok"]:
+            _finish("backup", False, f"原稿备份失败: {bk['stderr'] or bk['stdout']}")
+            return _fail()
+        _finish("backup", True, bk["stdout"][:300], path=bk["stdout"].strip())
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("backup", False, f"原稿备份失败: {exc}")
+        return _fail()
+
+    try:
+        # 2. 打包（同全流程：细纲 + 前情 + 细纲字段补强）
+        outline, packet = step_packet(book, chapter_id)
+        _finish("packet", True, f"细纲: {outline.relative_to(book).as_posix()}", packet=packet)
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("packet", False, f"打包失败: {exc}")
+        return _fail()
+
+    try:
+        # 3. 主笔生成（只生成，提交原始输出给下一环节）
+        #    note 非空 → 原文保持式重写：读本章已提交正文注入提示词（扩写/定点修订用）
+        #    note 含“扩到N字”→ 覆盖 packet 字数目标（主笔以此为权威），并供 wordcount 收敛用
+        note_range = _parse_wc_note(note)
+        if note_range is not None:
+            packet["wordcount_target"] = str(note_range[1])
+        original_prose = target.read_text(encoding="utf-8") if note else ""
+        draft = step_writer(book, chapter_id, packet, on_token=on_writer_token,
+                            note=note, original_prose=original_prose)
+        _finish("writer", True, f"生成 {len(draft)} 字")
+
+        # 4. 正文归一环节（独立正规环节：prose 提取 + 元信息清洗 + 自动跨章去重）→ 覆盖落盘
+        #    （重写唯一允许覆盖的点，旧稿已备份）
+        clean_draft, norm_report = step_normalize(book, chapter_id, draft)
+        rel = target.relative_to(book).as_posix()
+        target.write_text(clean_draft + "\n", encoding="utf-8")
+        _finish("normalize", True, f"覆盖落盘: {rel}（{len(clean_draft)} 字；{norm_report}）", path=rel, chars=len(clean_draft))
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("normalize", False, f"主笔生成/正文归一失败: {exc}")
+        return _fail()
+
+    # 4.5 字数收敛（D1，revision 同全流程；note 显式目标字 → override 判定目标）
+    try:
+        wc = step_wordcount_check(book, chapter_id)
+        note_range = (_parse_wc_note(note) if note else None)
+        if not wc["ok"]:
+            _finish("wordcount", False, f"字数检查失败（advisory，继续）: {wc.get('detail', '')}")
+        else:
+            wc = _apply_wc_note_override(wc, note_range)
+            actions = wc.get("actions") or []
+            actual = wc["actual"]
+            if "commit" in actions:
+                _finish("wordcount", True, f"字数 {actual}（{wc['status']}），无需处理", wordcount=wc)
+            elif "compress-once" in actions:
+                try:
+                    step_compress_once(book, chapter_id, packet, target, wc)
+                    wc2 = step_wordcount_check(book, chapter_id)
+                    if wc2["ok"]:
+                        wc2 = _apply_wc_note_override(wc2, note_range)
+                    _finish("wordcount", True, f"compress-once 后 {wc2.get('actual', '?')} 字（{wc2.get('status', '?')}），按{'note 目标' if note_range else '细纲'}收敛继续", wordcount=wc2)
+                except Exception as cexc:  # noqa: BLE001
+                    _finish("wordcount", True, f"compress-once 失败，按{'note 目标' if note_range else '脚本 action'}继续: {cexc}", wordcount=wc)
+            else:
+                hint = "（扩写不足目标，可再次重写加大扩充）" if note_range and wc["status"] == "under" else ""
+                _finish("wordcount", True, f"字数 {actual}（{wc['status']}），available_actions={actions}{hint}", wordcount=wc)
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("wordcount", False, f"字数收敛异常（继续）: {exc}")
+
+    try:
+        # 5-6. delta 草稿（对已提交章自动 revision 模式）+ 补语义
+        draft_path = step_delta_draft(book, chapter_id)
+        _finish("delta_draft", True, f"草稿: {draft_path.relative_to(book).as_posix()}")
+        step_delta_semantic(book, chapter_id, draft_path, target)
+        _finish("delta_semantic", True, "语义字段已补全")
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("delta_semantic", False, f"delta 处理失败: {exc}")
+        return _fail()
+
+    # 6.5 一致性审查（D2 detection，revision 同全流程）
+    try:
+        cons = step_consistency_check(book, chapter_id, target)
+        if cons["ok"]:
+            _finish(
+                "consistency", True,
+                f"审查记录: {cons['record_path']}（S1/S2={cons['open_s1_s2_count']}，S3/S4={cons['s3_s4_count']}）",
+                consistency=cons,
+            )
+        else:
+            _finish("consistency", False, f"一致性检查失败（advisory，继续）: {cons.get('detail', '')}")
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("consistency", False, f"一致性审查异常（继续）: {exc}")
+
+    # 6.6 deslop 机械层（advisory）—— R-WP1 前移（2026-09-15 外脑裁定选甲，与 write 链同一原则）：
+    #    deslop 会改写正文，须在 review_cycle 与 commit 之前。顺序：consistency → deslop → review_cycle → post_write。
+    reports = step_deslop(book, chapter_id, target)
+    _finish("deslop", True, f"脚本数: {len(reports)}", reports=reports)
+
+    # 6.7 审稿闭环（D3，时序对齐全流程：commit 前把 reviewed 准备好；revision A-5 豁免不影响语义一致性）
+    try:
+        rv = step_review_cycle(book, chapter_id, target, draft_path, review_id)
+        if rv["ok"]:
+            _finish(
+                "review_cycle", True,
+                f"{'通过' if rv['passed'] else '未通过'}（最高分 {rv['best_score']}，{rv['rounds']} 轮）",
+                review=rv,
+            )
+        else:
+            _finish("review_cycle", False, f"审稿闭环失败（advisory，继续）: {rv.get('detail', '')}")
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("review_cycle", False, f"审稿闭环异常（继续）: {exc}")
+
+    # 7. post_write（BLOCK 点，commit 消费 delta 里已就绪的 reviewed/enforced）
+    post = step_post_write(book, chapter_id, target)
+    # 同时消费 stdout + stderr：paragraph_gate BLOCK 详情走 stdout，commit/enforce 走 stderr
+    _finish("post_write", post["ok"],
+            (post["stdout"] + ("\n" + post["stderr"] if post["stderr"] else ""))[:2400],
+            returncode=post["returncode"], mode="revision")
+    if not post["ok"]:
+        # P2（外脑裁定）：commit BLOCK → 落恢复台账（重写链同样可能 commit 失败悬空）
+        _write_pending_commit_ledger(
+            book, chapter_id,
+            f"post_write BLOCK (rewrite):\n{post['stdout']}\n{post['stderr']}")
+        return _fail()
+
+    # P2：commit 成功 → 该章恢复台账失效即删
+    _clear_pending_commit_ledger(book, chapter_id)
+    return {"ok": True, "chapter_id": chapter_id, "mode": "revision", "stages": [s.to_dict() for s in stages]}
+
+
+# ---------------------------------------------------------------------------
+# 润色链（nww-deslop 的 Web 内联落地，2026-09-16 外脑裁定 + 用户拍板）：
+#   chat <execute> action=deslop 一键派单 → 备份 → LLM 去AI味保守润色 →
+#   归一落盘 → delta(revision) → post_write commit → 机械层复扫(advisory 反馈残留)。
+#   与重写链差异：不跑 review_cycle（避免审稿修订把润色清空不净重写一遍）；
+#   不走 wordcount compress（润色不改体量）。
+# ---------------------------------------------------------------------------
+_DESLOP_INLINE_SYSTEM = (
+    "你是去AI味润色执行师，执行写作引擎 nww-deslop 在 Web 端的保守落地点。\n"
+    "【首要原则（最高优先级）】保真优先：原句能通则不改，只消除 AI 味、语病与机械腔；"
+    "每一次删改必须换出更顺口的表达，整体增必须大于删；单处删改不超过一句，整章净删改 ≤15%，"
+    "绝不整段推倒重写、绝不发明原文没有的情节、绝不改变人物口吻与段落顺序。\n"
+    "【门禁核对清单（逐条过一遍，命中才动笔）】\n"
+    "1. 贅字贅词：修饰堆叠、语气词连用、冗余平白句；\n"
+    "2. 白话顺口：口癖句式（“不是…而是…”、“仿佛/宛如/好像”滥用）、缺口语节奏的长句拆分（长短句交替）；\n"
+    "3. 镜头感：转述式叙事转近身画面，视角人物当下的五官、动作优先；\n"
+    "4. 修辞降频：明喻/排比/对仗堆叠只保留最能打的；\n"
+    "5. 代词与指代：全文复查一遍，代词指代必须清晰；\n"
+    "6. 收束：不以说教、总结、升华收尾。\n"
+    "【输出格式】正文放在 <prose> 与 </prose> 标签之间，自 `# 第N章　标题` 起输出完整成稿；"
+    "标签前后不写任何说明、不写修改清单。"
+)
+
+
+def step_polish(book: Path, chapter_id: int, prose_text: str, on_token=None) -> str:
+    """去AI味 LLM 润色（nww-deslop 内联衔接步骤）：保真优先、删改 ≤15%、增大于删。"""
+    prompt = (
+        f"# 第{chapter_id}章润色任务\n"
+        f"对下面 <original> 中的正文执行去AI味保守润色，把完成稿放在 <prose> 标签内。\n"
+        f"<original>\n{prose_text[:8000]}\n</original>"
+    )
+    return _writer_stream(_DESLOP_INLINE_SYSTEM, prompt, on_token=on_token, temperature=0.3)
+
+
+def run_deslop_pipeline(book: Path, chapter_id: int, progress=None, on_writer_token=None) -> dict:
+    """润色已提交章节（revision 闭环）：旧稿备份 → LLM 去AI味润色 → 归一落盘 → revision 提交 → 复扫。
+
+    约定：只作用于「已有正文的已提交章」；正文不存在 → FAIL。
+    progress: 可选回调 (name, ok, detail) —— 每环节推进时调用（异步任务进度上报用）。
+    on_writer_token: 可选回调 (chunk) —— 润色流式输出逐 token 回调（异步任务实时预览用）。
+    """
+    book = book.resolve()
+    stages: list[StageResult] = []
+
+    def _finish(name: str, ok: bool, detail: str, **extra) -> None:
+        stages.append(StageResult(name, ok, detail, **extra))
+        if progress:
+            try:
+                progress(name, ok, detail)
+            except runtime.AgentCancelled:
+                raise
+            except Exception:  # noqa: BLE001 — 进度上报失败不影响主链
+                pass
+
+    def _fail() -> dict:
+        return {"ok": False, "chapter_id": chapter_id, "mode": "deslop", "stages": [s.to_dict() for s in stages]}
+
+    try:
+        # 0pre. 写前连续性闸（同重写链）：目标章前存在更小悬空章 → 先处理，否则 delta 会错判 revision
+        _last = _last_committed_chapter(book)
+        if _last is not None:
+            _pending = _pending_uncommitted_chapter(book, chapter_id, _last)
+            if _pending is not None:
+                _finish("backup", False,
+                        f"存在未提交章节：第{_pending}章已写正文但尚未提交（当前已提交到第{_last}章）。"
+                        f"请先对第{_pending}章执行「重写」完成提交，再润色后续章节。")
+                return _fail()
+
+        target = _resolve_existing_body(book, chapter_id)
+        if target is None:
+            _finish("backup", False, f"第{chapter_id}章无已提交正文（或正文已被备份改名）。无法润色不存在的章节。")
+            return _fail()
+
+        # 1. 写前备份（幂等：.backup/{章名}.orig.md 首份优先，已有不覆盖）
+        original = target.read_text(encoding="utf-8")
+        bk = toolbox.run_script("nww_backup.py", ["--book", str(book), "--file", str(target)], book, timeout=60)
+        if not bk["ok"]:
+            _finish("backup", False, f"原稿备份失败: {bk['stderr'] or bk['stdout']}")
+            return _fail()
+        _finish("backup", True, bk["stdout"][:300], path=bk["stdout"].strip())
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("backup", False, f"原稿备份失败: {exc}")
+        return _fail()
+
+    try:
+        # 2. LLM 去AI味保守润色（输出 <prose> 成稿；流式 token 回调给前端预览）
+        polished = step_polish(book, chapter_id, original, on_token=on_writer_token)
+        delta_len = len(polished) - len(original)
+        _finish("polish", True, f"润色完成：{len(original)} → {len(polished)} 字（净{'增' if delta_len >= 0 else '减'} {abs(delta_len)}）")
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("polish", False, f"去AI味润色失败: {exc}")
+        return _fail()
+
+    try:
+        # 3. 正文归一（<prose> 提取/元信息清洗/标题回填/跨章去重）→ 覆盖落盘（旧稿已备份）
+        clean, norm_report = step_normalize(book, chapter_id, polished)
+        rel = target.relative_to(book).as_posix()
+        target.write_text(clean + "\n", encoding="utf-8")
+        _finish("normalize", True, f"覆盖落盘: {rel}（{len(clean)} 字；{norm_report}）", path=rel, chars=len(clean))
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("normalize", False, f"正文归一/落盘失败: {exc}")
+        return _fail()
+
+    try:
+        # 4. delta 草稿（对已提交章自动 revision 模式）+ 语义补全（post_write commit 消费）
+        draft_path = step_delta_draft(book, chapter_id)
+        _finish("delta_draft", True, f"草稿: {draft_path.relative_to(book).as_posix()}")
+        step_delta_semantic(book, chapter_id, draft_path, target)
+        _finish("delta_semantic", True, "语义字段已补全")
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("delta_semantic", False, f"delta 处理失败: {exc}")
+        return _fail()
+
+    # 5. post_write（BLOCK 点，revision 提交）
+    post = step_post_write(book, chapter_id, target)
+    _finish("post_write", post["ok"],
+            (post["stdout"] + ("\n" + post["stderr"] if post["stderr"] else ""))[:2400],
+            returncode=post["returncode"], mode="revision")
+    if not post["ok"]:
+        # P2（同重写链）：commit BLOCK → 落恢复台账
+        _write_pending_commit_ledger(
+            book, chapter_id,
+            f"post_write BLOCK (deslop):\n{post['stdout']}\n{post['stderr']}")
+        return _fail()
+
+    # 6. 机械层复扫（advisory：复扫归零核对，残留只报不阻断，供前端展示）
+    reports = step_deslop(book, chapter_id, target)
+    _finish("rescan", True, f"复扫脚本数: {len(reports)}", reports=reports)
+
+    # P2：commit 成功 → 该章恢复台账失效即删
+    _clear_pending_commit_ledger(book, chapter_id)
+    return {"ok": True, "chapter_id": chapter_id, "mode": "deslop", "stages": [s.to_dict() for s in stages]}
+
+
+# ---------------------------------------------------------------------------
+# 局部修订链（nww-revision 只增不删算子 的 Web 落地，2026-09-16）：
+#   chat <execute> action=revise（须带 note 指定修订点）→ 备份 → LLM 定点增补（≤3 处）→
+#   只增不删 diff 硬核对 → 归一落盘 → delta(revision) → post_write commit → 机械层复扫。
+#   与 rewrite 差异：不改写已有句子、未新增情节，只在 note 指定处插入；diff 核对不通过不落盘。
+# ---------------------------------------------------------------------------
+_REVISE_INLINE_SYSTEM = (
+    "你是定点修订执行师，执行写作引擎 nww-revision 局部修订算子（只增不删）。\n"
+    "【硬约束（最高优先级）】\n"
+    "1. 只允许在 note 指定的位置**插入**新内容；<original> 里已有句子必须原样保留，"
+    "禁止改写、删减、合并或重排任何已有句子与段落顺序。\n"
+    "2. 单章增补 ≤3 处；每处 ≤2 句，紧贴原句写入，用原有人设口吻。\n"
+    "3. 禁止引入原文没有的新情节、新人物、新设定；新增内容必须实际增强文本"
+    "（补前因后果、补动作细节、强化情绪、拉长对话节奏），不写空话套话、不重复已有信息。\n"
+    "【输出格式】正文放在 <prose> 与 </prose> 标签之间，自 `# 第N章　标题` 起输出完整成稿"
+    "（= 原文 + 增补处），增补处不带任何标记。标签前后不写任何说明。"
+)
+
+
+def step_revise(book: Path, chapter_id: int, prose_text: str, note: str, on_token=None) -> str:
+    """定点修订 LLM pass：nww-revision 算子内联衔接（只增不删、单章 ≤3 处、每处 ≤2 句）。"""
+    prompt = (
+        f"# 第{chapter_id}章定点修订\n"
+        f"修订要求 note：\n{note}\n\n"
+        f"以下 <original> 是本章现有正文，请按约束输出「原文 + 增补」的完整成稿到 <prose>：\n"
+        f"<original>\n{prose_text[:8000]}\n</original>"
+    )
+    return _writer_stream(_REVISE_INLINE_SYSTEM, prompt, on_token=on_token, temperature=0.3)
+
+
+def _diff_guard_only_additions(original: str, revised: str, threshold: float = 0.06) -> dict:
+    """只增不删硬核对：对比原文与修订稿的字符级增删（difflib）。
+
+    返回 {ok, detail, inserted, removed}：removed 超过原文阈值 → 违反“只增不删”；inserted == 0 → 空转。
+    上限放宽到 6% 容差以容忍 normalize 的跨章去重与标题回填带来的少量差异。
+    """
+    sm = difflib.SequenceMatcher(None, original, revised)
+    removed = 0
+    inserted = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "delete":
+            removed += len(original[i1:i2])
+        elif tag == "insert":
+            inserted += len(revised[j1:j2])
+        elif tag == "replace":
+            removed += len(original[i1:i2])
+            inserted += len(revised[j1:j2])
+    cap = max(1, int(len(original) * threshold))
+    if removed > cap:
+        return {"ok": False, "detail": f"违反只增不删：删除 {removed} 字（上限 {cap}）", "inserted": inserted, "removed": removed}
+    if inserted == 0:
+        return {"ok": False, "detail": "未检测到任何新增内容（空转）", "inserted": 0, "removed": removed}
+    return {"ok": True, "detail": f"增 {inserted} 字 / 删 {removed} 字", "inserted": inserted, "removed": removed}
+
+
+def run_revise_pipeline(book: Path, chapter_id: int, progress=None, on_writer_token=None,
+                        note: str = "") -> dict:
+    """局部修订已提交章节（nww-revision 只增不删算子，revision 闭环）。
+
+    约定：只作用于「已有正文的已提交章」；正文不存在 → FAIL；note 必填（修订点/修订要求）。
+    progress: 可选回调 (name, ok, detail)；on_writer_token: 可选回调 (chunk)（前端实时预览）。
+    """
+    book = book.resolve()
+    note = (note or "").strip()
+    stages: list[StageResult] = []
+
+    def _finish(name: str, ok: bool, detail: str, **extra) -> None:
+        stages.append(StageResult(name, ok, detail, **extra))
+        if progress:
+            try:
+                progress(name, ok, detail)
+            except runtime.AgentCancelled:
+                raise
+            except Exception:  # noqa: BLE001 — 进度上报失败不影响主链
+                pass
+
+    def _fail() -> dict:
+        return {"ok": False, "chapter_id": chapter_id, "mode": "revise", "stages": [s.to_dict() for s in stages]}
+
+    if not note:
+        _finish("revise", False, "定点修订必须带 note（指定修订点/修订要求），无 note 无法执行。请改用「重写」或补全修订要求。")
+        return _fail()
+
+    try:
+        # 0. 悬空闸 + 目标章须已提交
+        _last = _last_committed_chapter(book)
+        if _last is not None:
+            _pending = _pending_uncommitted_chapter(book, chapter_id, _last)
+            if _pending is not None:
+                _finish("backup", False,
+                        f"存在未提交章节：第{_pending}章已写正文但尚未提交（当前已提交到第{_last}章）。"
+                        f"请先对第{_pending}章执行「重写」完成提交，再修订后续章节。")
+                return _fail()
+
+        target = _resolve_existing_body(book, chapter_id)
+        if target is None:
+            _finish("backup", False, f"第{chapter_id}章无已提交正文（或正文已被备份改名）。无法修订不存在的章节。")
+            return _fail()
+
+        # 1. 写前备份（幂等）
+        original = target.read_text(encoding="utf-8")
+        bk = toolbox.run_script("nww_backup.py", ["--book", str(book), "--file", str(target)], book, timeout=60)
+        if not bk["ok"]:
+            _finish("backup", False, f"原稿备份失败: {bk['stderr'] or bk['stdout']}")
+            return _fail()
+        _finish("backup", True, bk["stdout"][:300], path=bk["stdout"].strip())
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("backup", False, f"原稿备份失败: {exc}")
+        return _fail()
+
+    try:
+        # 2. LLM 定点增补（输出 <prose> 完整成稿）
+        revised = step_revise(book, chapter_id, original, note, on_token=on_writer_token)
+        _finish("revise", True, f"定点修订完成（{len(revised)} 字）")
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("revise", False, f"定点修订失败: {exc}")
+        return _fail()
+
+    try:
+        # 3. 正文归一 + 只增不删 diff 硬核对（违反则失败且不落盘，旧稿保持原状）
+        clean, norm_report = step_normalize(book, chapter_id, revised)
+        guard = _diff_guard_only_additions(original, clean)
+        if not guard["ok"]:
+            _finish("revise_diff", False, f"只增不删核对失败：{guard['detail']}（修订稿未落盘，原稿未改动）", diff=guard)
+            return _fail()
+        rel = target.relative_to(book).as_posix()
+        target.write_text(clean + "\n", encoding="utf-8")
+        _finish("normalize", True, f"覆盖落盘: {rel}（{len(clean)} 字；{norm_report}；{guard['detail']}）",
+                path=rel, chars=len(clean), diff=guard)
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("normalize", False, f"正文归一/落盘失败: {exc}")
+        return _fail()
+
+    try:
+        # 4. delta 草稿（revision 模式）+ 语义补全
+        draft_path = step_delta_draft(book, chapter_id)
+        _finish("delta_draft", True, f"草稿: {draft_path.relative_to(book).as_posix()}")
+        step_delta_semantic(book, chapter_id, draft_path, target)
+        _finish("delta_semantic", True, "语义字段已补全")
+    except runtime.AgentCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _finish("delta_semantic", False, f"delta 处理失败: {exc}")
+        return _fail()
+
+    # 5. post_write（BLOCK 点，revision 提交）
+    post = step_post_write(book, chapter_id, target)
+    _finish("post_write", post["ok"],
+            (post["stdout"] + ("\n" + post["stderr"] if post["stderr"] else ""))[:2400],
+            returncode=post["returncode"], mode="revision")
+    if not post["ok"]:
+        _write_pending_commit_ledger(
+            book, chapter_id,
+            f"post_write BLOCK (revise):\n{post['stdout']}\n{post['stderr']}")
+        return _fail()
+
+    # 6. 机械层复扫（advisory）
+    reports = step_deslop(book, chapter_id, target)
+    _finish("rescan", True, f"复扫脚本数: {len(reports)}", reports=reports)
+
+    _clear_pending_commit_ledger(book, chapter_id)
+    return {"ok": True, "chapter_id": chapter_id, "mode": "revise", "stages": [s.to_dict() for s in stages]}
